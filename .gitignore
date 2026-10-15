@@ -1,0 +1,41 @@
+# 模型文件（约 21MB，不提交；README 有下载/导出说明）
+models/
+
+# Claude Code 本地设置与说明（不进仓库）
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地测试临时文件
+*.log
+# --perf-log 的输出（单次测量快照，不提交）
+performance_log.csv
+
+# 实拍读数 CSV 与报告（逐帧角度 = 个人身体数据，不提交；只在本地留档）
+# 真机实采按 front_p1_live1.csv 这种命名，用通配盖住换人/换次的新名字
+f45.csv
+front.csv
+front_p*.csv
+*_report.txt
+# 各入口/脚本的默认输出（内容同样是实拍读数）。
+# 这些文件现在一律落在 data/ 下，而下面的模式都**不含斜杠** —— git 的规则是无斜杠模式
+# 在任意层级都匹配，所以加了 data/ 前缀后照旧被挡住，模式一个都不用改。
+fhp_frames.csv
+fhp_cva_proxy.csv
+front_ear_shoulder_proxy.csv
+pose_schema_dump.json
+# Molaeifar 实验脚本（tools/test_molaeifar_sternum_angle.py）的产物一律不入仓库：
+# 逐帧 CSV 含关键点像素坐标（= 个人身体数据）；汇总表/报告是派生量，
+# 需要时用 --analyze-only data/molaeifar_frames_front.csv data/molaeifar_frames_45.csv 现算。
+molaeifar_frames*
+# Salahzadeh 文献阈值核对脚本（tools/test_salahzadeh_cva_thresholds.py）的产物：
+# 逐帧 CSV 含实拍读数，markdown/报告是同一批读数的派生表 —— 一律不入仓库。
+salahzadeh_cva_*
+# 实测基线存档（data/archive/）：原始实采 CSV 的单文件快照 + 由它推出来的阈值清单。
+# 同样是个人的逐帧读数，只是多留一份「别被误删」的副本 —— 一律不入仓库。
+archive/
+measured_basis_*
+measured_raw_*

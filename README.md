@@ -4,8 +4,8 @@
 
 > 本项目是**「后续用机器人检测人体动作、判断后做出反应」这一目标的简易 Demo 前置版**：先把「检测关键点 → 算动作特征 → 判动作」的整条链路在本机跑通，为机器人集成打基础。
 
-- 桌面版：OpenCV 实时窗口，本机（USB）摄像头
-- **这是动作识别仓库，不是坐姿仓库**。它与坐姿项目 `rtm_demo` 是**各自独立的两个仓库**（本仓库由后者分叉而来），本仓库**只做全身动作**。
+- 桌面版：OpenCV 实时窗口。单机入口用**一台 USB 外接摄像头**（固定摆在 45° 前侧机位）；另有**双摄入口**同时跑两台（扩展坞），左右并排一个窗口
+- **这是动作识别仓库，不是坐姿仓库**。它与坐姿项目 `rtm_demo` 是**各自独立的两个仓库**（本仓库由后者分叉而来）：本仓库只做全身动作，分叉时带过来的坐姿代码已于 2026-10-15 全部删除，坐姿那套代码的家在旧仓库 `rtm_demo`。
 
 ## 功能
 
@@ -16,7 +16,7 @@
 
 画面上显示：两条动作的**实时读数** + **状态标签**，以及角度几何辅助线（抬升角的竖直参考轴、耳→鼻连线）。骨架照常画（COCO 全身）。
 
-**这条线是旁路**：两个动作各有各的特征与判定，互不干扰，也不影响本仓库里仍混着的坐姿代码（见「已知范围与限制」）。
+两个动作各有各的特征与判定，互不干扰：举手用抬升角、仰头用头俯仰代理角，两条线各算各的。
 
 ## 环境要求
 
@@ -50,12 +50,11 @@ https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-s_simcc-body
 
 在 `rtm_action_demo/` 目录下运行。命令里的 `python` 指装了依赖的解释器（见「环境要求」）。
 
-### 桌面版
+### 桌面版（单机，一台摄像头）
 
 ```bash
 python main_action_demo.py                                   # 默认：USB 那台（45° 前侧）；举手只报数，仰头判状态
 python main_action_demo.py --arm-rule raise                   # 举手也开状态机
-python main_action_demo.py --camera 0                         # 换回笔记本内置摄像头（正对机位；仰头会判几何退化）
 python main_action_demo.py --no-geometry                      # 不画角度几何辅助线
 python main_action_demo.py --no-skeleton                      # 不画骨架
 python main_action_demo.py --snapshot data/action_snap.png    # 按 s 存当前帧
@@ -64,23 +63,44 @@ python main_action_demo.py --selftest                         # 合成数据自�
 
 按键：**`s` 存快照**（需 `--snapshot` 指定路径）、**ESC 退出**。首帧较慢（惰性初始化模型），正常。
 
-### 摄像头怎么选
+### 双摄版（扩展坞上两台，一个窗口并排）
 
-- **`--camera 0`** = 笔记本**内置**摄像头（**正对着人**）
-- **`--camera 1`** = **USB 外接**摄像头（**默认**，摆在前侧约 45°）
+```bash
+python main_dual_demo.py --list-cameras                       # 先查：0..5 哪些编号能用（认编号用）
+python main_dual_demo.py                                     # 两台用 capture 里的默认编号
+python main_dual_demo.py --cameras 2,1                        # 显式指定两台编号（左 A / 右 B）
+python main_dual_demo.py --width 640 --height 480             # 带宽不够时降分辨率
+python main_dual_demo.py --display-width 1920                 # 窗口整宽上限（默认按屏幕自动）
+python main_dual_demo.py --snapshot data/dual_snap.png        # 按 s 存拼好的整张
+python main_dual_demo.py --selftest                           # 合成数据自测（不碰摄像头/模型）
+```
+
+左半幅 = `cam A`、右半幅 = `cam B`（顺序就是 `--cameras` 的顺序），各有自己的骨架 + 四行读数，左下角标着名字。**这个入口两台都只报数、不判状态**（两行状态都写 `not decided (report only)`）——先把两个机位的数看明白，要判状态用单机入口。按键同上，ESC 一次关掉两路。
+
+**窗口会按屏幕宽度自动缩**：两台 1280x720 并排是 2560 宽，屏幕只有 1280 宽时右半幅会整个跑到屏幕外（只看得到左边那台）。所以每半幅读帧后先等比缩到「屏幕宽 × 96% ÷ 2」再推理/绘制（角度读数不受等比缩放影响），窗口首帧钉到左上角。缩放上限可用 `--display-width PX` 改，传很大的值（如 `99999`）就不缩。启动时控制台会打一行实际用的上限。
+
+### 摄像头与机位
+
+**单机入口**只认**那一台** USB 外接摄像头，编号写死在 `capture.py` 的常量里：
+
+```python
+USB_CAMERA_INDEX = 2     # 2026-10-18 实拍确认：2 = 扩展坞上那台（45° 前侧），1 = 正对机位那台
+USB_CAMERA_INDEX_B = 1   # 双摄入口的第二台——枚举顺序不稳，插上后按实际编号改
+```
+
+单机入口**没有"选摄像头"这个参数**（连 `--camera` 都不存在），接上就能跑；换机器、插口顺序变了导致编号不同，就改 `USB_CAMERA_INDEX`。**双摄入口**则接受 `--cameras A,B` 显式指定两台（不传就用上面两个常量）——USB 扩展坞的枚举顺序常常不稳，所以那边留了开关；两台打开时会各自打印「编号 + 实到分辨率」，认不准就照着改。
 
 **这两个动作对机位的要求不一样**：
 
 - **举手**：竖直方向的动作，**哪个机位都能量**；
 - **仰头**：**必须侧对 / 45° 前侧**。正对着摄像头时，仰头主要是朝镜头方向的透视缩短，耳-鼻在画面上几乎不动——**程序会判「几何退化」，读数直接显示 N/A**，而不是给你一个看着像真的错数（详见「已知范围与限制」）。
 
-所以默认跑的就是 USB / 45° 那台。摄像头序号由插拔顺序决定，认不准就用 `--camera N` 试。
+所以本项目的机位就是 USB / 45° 那台（机位由入口文件声明，不是命令行开关）。
 
 ## 命令行参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--camera N` | `1` | 摄像头序号（`0` = 内置/正对，`1` = USB/45°） |
 | `--arm-rule {off,raise}` | `off` | **`off` = 举手只报数不判状态**；`raise` = 开启举手状态机 |
 | `--arm-raise-enter D` | `45.0` | 抬升角 **≤ D** 判「已举起」（度；**占位值，待标定**） |
 | `--arm-raise-exit D` | `60.0` | 抬升角 **≥ D** 判「已放下」（度；迟滞带上沿，**占位值**） |
@@ -91,6 +111,18 @@ python main_action_demo.py --selftest                         # 合成数据自�
 | `--no-skeleton` | 关 | 不画骨架 |
 | `--snapshot PATH` | 无 | 按 `s` 把当前帧存到 PATH |
 | `--selftest` | — | 合成数据自测各层（不碰摄像头 / 模型） |
+
+`main_dual_demo.py` 的参数（**没有 `--arm-rule`：它不判状态**）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--list-cameras [N]` | — | **只枚举、不跑主循环**：把编号 `0..N-1` 挨个试着打开，打印哪些能用和实到分辨率（不带 N 就扫 `0..5`）。认不准 `--cameras` 时先跑这个 |
+| `--cameras A,B` | `2,1` | 两台的摄像头编号（左 A / 右 B），必须不同。默认取 `capture.USB_CAMERA_INDEX` / `USB_CAMERA_INDEX_B` |
+| `--width` / `--height` | `1280` / `720` | 期望分辨率。两台挂一个扩展坞带宽不够时降到 `640x480` |
+| `--display-width PX` | `0`（自动） | 拼图整窗最大显示宽度；默认按屏幕宽度留 4% 边距。每半幅先等比缩到这个上限的 1/2 再推理/绘制。传很大的值可关掉缩放 |
+| `--tilt-min-dx-ratio R` | `0.15` | 同单机入口（仰头横向退化门控） |
+| `--log-interval SEC` | `0.5` | 控制台每台每 SEC 秒打一行实时读数；`0` = 不打（本入口不判状态，没法靠状态变化触发打印，所以按时间限流） |
+| `--no-geometry` / `--no-skeleton` / `--snapshot PATH` / `--selftest` | — | 同单机入口 |
 
 ## 阈值标定
 
@@ -116,9 +148,10 @@ python main_action_demo.py --selftest                         # 合成数据自�
 
 ```
 rtm_action_demo/
-├── main_action_demo.py   # 【动作线入口】装配各层、跑主循环；只装举手/仰头
+├── main_action_demo.py   # 【单机入口】装配各层、跑主循环；一台 USB 摄像头
+├── main_dual_demo.py     # 【双摄入口】两台并排一个窗口；两台都只报数、不判状态
 ├── requirements.txt      # Python 依赖（pip install -r requirements.txt）
-├── capture.py            # 图像输入：FrameSource / CameraCapture（默认 index 1 = USB/45°）
+├── capture.py            # 图像输入：FrameSource / CameraCapture（编号默认写死，双摄入口可传）
 ├── pose_estimation.py    # RTMPose 推理：17 个 COCO 关键点
 ├── features.py           # 特征：ArmRaiseFeatures（上臂抬升角+肘角）、HeadTiltFeatures（耳→鼻俯仰角）
 ├── decision.py           # 判断：ArmRaiseDecision（DOWN/RAISED）、HeadTiltDecision（NEUTRAL/TILTED_BACK）
@@ -126,12 +159,11 @@ rtm_action_demo/
 ├── pose_schema.py        # 姿态对齐：COCO17 / 机器人 27 舵机 → 统一 27 DOF 规范 schema（为对接机器人预留）
 ├── models/               # RTMPose ONNX 模型（未提交）
 └── data/                 # 输出目录（快照等；被 .gitignore 挡住，仓库里只提交 .gitkeep）
-
-  ※ 以下为本仓库里仍混着的、从坐姿仓库分叉带来的文件，动作线不使用：
-    main_demo.py / main_front_demo.py / web_demo.py / perf_logger.py / tools/
 ```
 
 数据流：`capture → pose_estimation → features → decision → output`，各层职责单一、接口稳定。
+
+`pose_schema.py` 是**纯标准库**模块（不 import cv2/numpy），为将来"人体→机器人关节映射"预留，当前数据流不用它；可单独跑 `python pose_schema.py` 自测。
 
 关键点编号为 **COCO 17 点标准**：0 鼻、3/4 耳、5/6 肩、7/8 肘、9/10 腕、11/12 髋等。
 
@@ -139,7 +171,7 @@ rtm_action_demo/
 
 - **先跑几轮实拍**，把举手 / 仰头的 enter/exit 从占位值换成标定值；顺便决定举手是开状态机还是继续只报数。
 - **加更多动作**（挥手 / 转身 / 蹲下…）：照 `ArmRaiseFeatures` + `ArmRaiseDecision` 的样子各加一对类，接口不变。
-- **机器人摄像头**：当前用的是本机摄像头；后续接入机器人摄像头时，只需在 `capture.py` 新增一个图像源子类，上层数据流不用改。
+- **机器人摄像头**：当前用的是本机 USB 摄像头；后续接入机器人摄像头时，只需在 `capture.py` 新增一个图像源子类（`FrameSource` 的子类），上层数据流不用改。
 - **人体 → 机器人关节映射**：在 `pose_schema.py` 的规范 27 DOF 空间里做（人体侧角度/位置 → 机器人目标角）。
 - **多目标 / 人不在画面中心**：`pose_estimation.py` 接 RTMDet 检测器，给 `detect_pose` 加可选 bbox，上层不用改。
 
@@ -151,6 +183,8 @@ rtm_action_demo/
 - **仰头角是 2D 代理，不是真实俯仰角**：COCO 17 没有下巴 / 耳屏，用「耳点 + 鼻尖」代替头部轴；45° 机位下水平方向被压缩，读数比真实角大，**只保证单调**（仰头越大读数越大），量值与任何文献的头屈伸角都不可比。**不补偿转头**（yaw），头往侧面转也会串进读数。
 - **举手角是像素空间的上臂朝向**：单目 2D，不含深度；只看「肩→肘」朝向，手腕丢失不影响触发。
 - **v1 刻意不做平滑**：不 EMA、不中值、不维持上一有效值。关键点丢帧就标无效、读数写 N/A。这是为了先看清楚「单目关键点撑不撑得住全身动作」这个问题本身。
-- **单 / 多人**：目前按「整帧单一人」处理（top-down 无检测器）。
-- **同仓库还混着坐姿版代码**：本仓库由坐姿项目 `rtm_demo` 分叉而来，那些坐姿 / CVA / 头前伸的代码与 `tools/` 下的标定脚本**都还在**，但**动作线完全不用它们**。相关说明见旧仓库 `rtm_demo` 的文档。
+- **单 / 多人**：目前按「整帧单一人」处理（top-down 无检测器；整帧失败时按人像区域裁剪重推，是接检测器之前的临时替代）。
+- **双摄入口不判状态**：`main_dual_demo.py` 两台都只报数（两行状态写 `not decided (report only)`）。两个机位里有几个能测仰头、读数基线各是多少，要先看数据才知道，所以这一档刻意不判。要判定用单机入口。
+- **双摄的帧率**：两台是**顺序**读帧、顺序推理（没有多线程），帧率约为单机的一半。看数够用；真要两台都跑满再单独做一轮。
+- **双摄的编号**：USB 扩展坞的枚举顺序常常不稳，`--cameras A,B` 就是为此留的。**认不准就先跑 `--list-cameras`**，它把 `0..N-1` 挨个开一遍、列出哪些能用和实到分辨率；两台同型号时分辨率也一样，那就得看画面内容才知道哪个编号对应哪个机位。两台打开时还会各自打印「编号 + 实到分辨率」。
 - **模型**：使用 rtmpose-s（`models/` 内）

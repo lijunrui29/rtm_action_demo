@@ -2,7 +2,7 @@
 pose_schema 层：把人体 / 机器人两端的姿态数据，统一到同一个"规范关节 schema"。
 
 背景（2026-09-01，为"人体动作映射到机器人关节"做的第一步）：
-    人体侧（rtm_demo/pose_estimation.py 的 detect_pose）输出 COCO 17 个关键点的
+    人体侧（pose_estimation.py 的 detect_pose）输出 COCO 17 个关键点的
     **位置**（归一化 2D 坐标 + 置信度，数字编号）。
     机器人侧（figurobot-console/robot_bridge.py 的 /api/pose）输出 27 个舵机的
     **角度**（度，相对零点，servo ID 编号）。
@@ -212,7 +212,8 @@ def human_adapter(pose_result) -> dict:
 
 
 def _midpoint_if(xy: dict, a: int, b: int):
-    """可见点 a/b 的中点；只有一侧可见时用那一侧的点（与 features._avg 同策略）。"""
+    """可见点 a/b 的中点；只有一侧可见时用那一侧的点
+    （与 features.HeadTiltFeatures 的单耳回退同策略）。"""
     got = [xy[pid] for pid in (a, b) if pid in xy]
     if not got:
         return None
@@ -300,7 +301,8 @@ def _heuristic_angle(joint: dict, xy: dict, neck, pelvis):
                 return math.degrees(math.atan2(nose[0] - mid_x, width))
         return None
 
-    # 躯干前倾：肩中点→髋中点 向量相对竖直（与 features torso_angle 同源）
+    # 躯干前倾：肩中点→髋中点 向量相对竖直
+    # （本仓库动作线不用这个量；这是给机器人映射留的 2D 弱推导）
     if name == "waist_pitch":
         if neck is not None and pelvis is not None:
             return _angle_from_vertical(neck, pelvis)
@@ -441,7 +443,8 @@ def robot_schema_from_bridge(base_url: str = "http://127.0.0.1:8888",
 
 
 # ---------------------------------------------------------------------------
-# 自测：合成数据验证 human/robot adapter + 命名表（main_demo.py --selftest 汇总调用）
+# 自测：合成数据验证 human/robot adapter + 命名表
+# （纯 stdlib，不碰摄像头/模型：python pose_schema.py 直接跑）
 # ---------------------------------------------------------------------------
 
 def _make_pose(pts: dict) -> dict:
@@ -583,9 +586,11 @@ def selftest_schema() -> None:
     # ---------- 5) 空 schema ----------
     _assert(empty_schema("robot")["source"]["kind"] == "robot", "empty_schema kind 应为 robot")
 
-    # ---------- 6) JSON 导出往返（output.export_pose_json 已在此路径覆盖） ----------
-    from output import export_pose_json
-    text = export_pose_json(sch)
+    # ---------- 6) JSON 导出往返 ----------
+    # 直接用 stdlib 序列化：本模块是纯 stdlib 的，自测不该为了这一条去 import
+    # 带 cv2/numpy 的 output.py（那会让 `python pose_schema.py` 依赖一整套视觉栈）。
+    # 落盘时（若要存 schema）用同一套参数 ensure_ascii=False / indent=2。
+    text = json.dumps(sch, ensure_ascii=False, indent=2)
     back = json.loads(text)
     _assert(back["schema_version"] == sch["schema_version"], "JSON 导出应可往返")
     _assert(len(back["joints"]) == 27, "JSON 导出应含 27 个 DOF")

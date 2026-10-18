@@ -1,21 +1,17 @@
 """
-全身动作识别 demo（举手 / 仰头）—— **独立动作线**，2026-10-12 新增。
+RTMPose 全身动作识别 demo（举手 / 仰头）—— **单机入口**
+（另有双摄入口 main_dual_demo.py，两台并排、只报数不判状态）。
 
-和现有的坐姿 / CVA / 头前伸那条线**没有任何关系**：本入口不装配、不 import 那条
-线的任何对象（没有 FeatureExtractor / PostureFeatures / CvaProxyFeatures /
-FhpDecision，也没有任何提醒），画面上只有举手和仰头两组读数 + 状态。反过来，
-另外两个入口（main_demo.py = 45° 前侧坐姿线 / main_front_demo.py = 正面实验行）
-也完全不受本文件影响 —— 这条线是旁路，进出都不碰它们。
+数据源**有且仅有一台**：那台 USB 外接摄像头（见 capture.USB_CAMERA_INDEX），
+编号写死在 capture 层，本入口连"选哪台"的参数都没有。机位固定为 45° 前侧，
+由**入口文件**声明（不是命令行开关）—— 换机位要重做/重标，别把这里的读数当
+跨机位通用。
 
-机位要求（**重要**）：
-    本入口假定摄像头在正前方偏一侧（约 45° 前侧），与 main_demo.py 同机位
-    （机位由入口文件声明，与 CLAUDE.md「机位路由」同思路）。两个动作对这个
-    机位的依赖完全不同：
-      * **举手**：任意机位都能测 —— 上臂朝上在哪个视角都看得见；
-      * **仰头**：**只在侧对 / 45° 前侧有意义**。正对摄像头时仰头主要是"朝镜头
-        方向的透视缩短"，耳-鼻在像面上几乎不动，读数不反映仰头大小（见
-        features.HeadTiltFeatures 的"近似在哪"）。所以本入口不是"正面入口"。
-    换机位（尤其换到正对）要重做/重标，别把这里的读数当跨机位通用。
+两个动作对这个机位的依赖完全不同（**别混为一谈**）：
+  * **举手**：任意机位都能测 —— 上臂朝上在哪个视角都看得见；
+  * **仰头**：**只在侧对 / 45° 前侧有意义**。正对摄像头时仰头主要是"朝镜头
+    方向的透视缩短"，耳-鼻在像面上几乎不动，读数不反映仰头大小（见
+    features.HeadTiltFeatures 的"近似在哪"）。所以本入口**不是"正面入口"**。
 
 两个角怎么构造（用哪些关键点，全在 features 层，像素空间）：
     举手（features.ArmRaiseFeatures）：
@@ -33,9 +29,9 @@ FhpDecision，也没有任何提醒），画面上只有举手和仰头两组读
            2D head-pose 代理，**不是真实俯仰角**（阈值只能本项目自己定，别套文献）；
            2D 投影下 45° 机位水平方向被压缩，读数只保证**单调**；**不补偿转头
            （yaw）** —— 画面上那条耳-鼻几何线转没转一眼能看出来。
-           刻意**不用现成的 PostureFeatures.head_neck_angle**：耳朵几乎就在头后仰
-           的旋转轴心上，仰头时耳几乎不动，那个角量的是头相对躯干的**平移**前伸，
-           不是**转动**俯仰，两回事。
+           刻意**不用"耳→肩"那一类角度**：耳朵几乎就在头后仰的旋转轴心上，仰头
+           时耳几乎不动，那个角量的是头相对躯干的**平移**前伸，不是**转动**俯仰，
+           两回事（features 层因此没有这类特征）。
            零点不在 0：45° 机位下中立站姿实测约 -20~-30°（鼻尖天生略低于耳中点），
            所以仰头阈值要按画面上的中立读数往上加，别照数字本身调。
            横向退化门控（--tilt-min-dx-ratio）：正对镜头时这个角会退化成
@@ -45,8 +41,7 @@ FhpDecision，也没有任何提醒），画面上只有举手和仰头两组读
 v1 的两个刻意取舍（**别悄悄改**）：
     1) **不做任何平滑**：不 EMA、不中值、不"维持上一有效值"。关键点丢帧就标
        invalid、读数写 N/A，抖动就原样跳出来 —— 本轮的命题是"单目关键点撑不撑
-       得住全身动作"，加平滑/维持恰好会把这两个最该被看到的信号掩盖掉
-       （与 CvaProxyFeatures 的"降级维持上一有效值"故意相反）。
+       得住全身动作"，加平滑/维持恰好会把这两个最该被看到的信号掩盖掉。
     2) **举手这条线默认只报数、不判状态**（--arm-rule 默认 off）：先看几眼数据，
        再决定触发用抬升角还是肘角。判据类（decision.ArmRaiseDecision）已经写好并
        自测通过，`--arm-rule raise` 就能开。仰头那条线按计划带状态机（角度唯一、
@@ -56,15 +51,14 @@ v1 的两个刻意取舍（**别悄悄改**）：
 -head-tilt-exit 可现场改）：读数的中立基线随摄像头高度/机位/人体比例变化，
 先跑起来看画面上的数再定。
 
-用法（在 rtm_demo/ 目录下运行。--camera 默认 = capture.DEFAULT_CAMERA_INDEX，
-本机 = USB 外接那台、固定在 45° 前侧；想用别的摄像头显式传 --camera N）：
+用法（在 rtm_action_demo/ 目录下运行；摄像头只能是 USB_CAMERA_INDEX 那台，
+没有"选摄像头"的参数 —— 换插口顺序变了就改 capture.USB_CAMERA_INDEX）：
     python main_action_demo.py                              # 举手只报数，仰头判状态
     python main_action_demo.py --arm-rule raise              # 举手也开状态机
     python main_action_demo.py --arm-raise-enter 30 --arm-raise-exit 50
     python main_action_demo.py --head-tilt-enter -5 --head-tilt-exit -15
     python main_action_demo.py --no-geometry                 # 不画角度几何辅助线
     python main_action_demo.py --snapshot data/action_snap.png  # 按 s 存当前帧
-    python main_action_demo.py --camera 0                    # 换回笔记本内置（正对机位，仰头会判退化）
     python main_action_demo.py --selftest                    # 合成数据自测（不碰摄像头）
 
 按键：s 存快照（需 --snapshot 指定路径，否则忽略）、ESC 退出。
@@ -78,11 +72,11 @@ import sys
 import time
 from pathlib import Path
 
-# 本目录（rtm_demo）内的模块直接 import（与另外两个入口同约定）
+# 本目录（rtm_action_demo）内的模块直接 import
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from capture import CameraCapture, DEFAULT_CAMERA_INDEX   # noqa: E402
+from capture import CameraCapture                        # noqa: E402
 from pose_estimation import detect_pose                  # noqa: E402
 from features import (ArmRaiseFeatures,                  # noqa: E402
                       HeadTiltFeatures,
@@ -95,14 +89,11 @@ from output import FrameRenderer, selftest_action_overlay  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """构造参数表（本入口专属，与另外两个入口的参数表互不影响）。"""
+    """构造参数表（全是动作线自己的旋钮；**没有摄像头选择** —— 只有那一台）。"""
     p = argparse.ArgumentParser(
-        description="全身动作识别 demo（举手 / 仰头）—— 45° 前侧机位，独立动作线")
+        description="RTMPose 全身动作识别 demo（举手 / 仰头）—— 45° 前侧机位，"
+                    "数据源固定为 USB 那一台摄像头")
 
-    p.add_argument("--camera", type=int, metavar="INDEX",
-                   default=DEFAULT_CAMERA_INDEX,
-                   help=f"摄像头编号（默认 {DEFAULT_CAMERA_INDEX} = USB 外接/45° 那台；"
-                        f"传 0 用笔记本内置，内置是正对机位，仰头特征会判几何退化）")
     p.add_argument("--arm-rule", choices=("off", "raise"), default="off",
                    help="举手这条线怎么判：off（默认）= 只报角度不判状态；"
                         "raise = 按上臂抬升角（<= enter 判 RAISED）跑状态机。"
@@ -140,15 +131,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
-    """动作线主循环（单进程）：摄像头 → pose → 两个动作特征 → 两个判定 → 画面。
+    """动作线主循环（单进程）：USB 摄像头 → pose → 两个动作特征 → 两个判定 → 画面。
 
-    只装配本动作线的对象：坐姿/CVA/头前伸那条线的对象**一个都不建**
-    （不更新、不画、不提醒）。举手那条线的判定按 --arm-rule 决定建不建。
+    举手那条线的判定按 --arm-rule 决定建不建（默认 off = 只报数）。
     """
     import cv2
 
-    src = CameraCapture(args.camera if args.camera is not None else DEFAULT_CAMERA_INDEX,
-                        width=1280, height=720)
+    src = CameraCapture(width=1280, height=720)
     arm_feats = ArmRaiseFeatures()
     head_feats = HeadTiltFeatures(min_dx_span_ratio=args.tilt_min_dx_ratio)
     # 举手：默认（off）**不建判定对象** —— 画面上明说"只报数不判"，不假装判过
@@ -162,10 +151,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if args.snapshot:
         Path(args.snapshot).parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[action] 摄像头：#{src.index}"
-          + ("（= 默认，本机为 USB 外接/45° 那台）" if src.index == DEFAULT_CAMERA_INDEX
-             else f"（默认是 #{DEFAULT_CAMERA_INDEX}，这里被 --camera 覆盖了）"))
-    print("[action] 机位：45° 前侧（与 main_demo.py 同）。举手任意机位可测；"
+    print(f"[action] 数据源：USB 摄像头 #{src.index}（capture.USB_CAMERA_INDEX，"
+          f"编号写死、没有 --camera）")
+    print("[action] 机位：45° 前侧。举手任意机位可测；"
           "**仰头只在侧对/45° 前侧有意义**，正对摄像头测不到")
     print("[action] 举手判据："
           + ("off —— 只报抬升角/肘角，不判状态（先看数据）"
@@ -180,7 +168,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print(f"[action] 仰头退化门控：|Δx|/双耳间距 < {args.tilt_min_dx_ratio:.2f} "
           f"判几何退化（正对镜头）→ 读数 N/A、状态 UNKNOWN（不给假数）")
     print("[action] 阈值都是**占位值**（不是标定结果），读数基线随机位/人变；"
-          "本线无提醒、不平滑（丢帧即 N/A），与坐姿/CVA 那条线无关")
+          "本线无提醒、不平滑（丢帧即 N/A）")
 
     # 控制台只在**状态变化**时打一行（用于确认状态确实在变，不刷屏）
     prev = {ArmRaiseState.UNKNOWN, HeadTiltState.UNKNOWN}
@@ -349,10 +337,10 @@ def _selftest_end_to_end() -> None:
 
 
 def selftest() -> None:
-    """本动作线各层自测 + 端到端合成帧检查（不碰摄像头）。
+    """各层自测 + 端到端合成帧检查（不碰摄像头、不碰模型）。
 
-    只跑本线的用例：坐姿/CVA/头前伸那条线的自测在各自入口里
-    （main_demo.py --selftest），这条线不碰它们。
+    这是本仓库唯一的自测入口：六项分别是 features 两个、decision 两个、
+    output 一个，再加一条端到端把 pose→features→decision→output 走通。
     """
     print("===== 1. features: arm raise angles =====")
     selftest_arm_raise()
@@ -370,7 +358,7 @@ def selftest() -> None:
 
 
 def main() -> None:
-    """动作线入口：只装举手 / 仰头这两个动作，不碰坐姿/CVA 那条线。"""
+    """入口：只装举手 / 仰头这两个动作。"""
     args = build_parser().parse_args()
     if args.selftest:
         selftest()

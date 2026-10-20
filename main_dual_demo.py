@@ -7,7 +7,8 @@ RTMPose 全身动作识别 demo —— **双摄入口**（扩展坞上两台 USB
 影响**，单机那台照旧跑。
 
 画面：**一个窗口左右并排**（左 = cam A、右 = cam B），每半幅各有自己的骨架 +
-四行读数/状态，左下角标 `cam A` / `cam B`。`s` 存的是**拼好的整张**。
+每个动作两行读数/状态（`--actions` 控制显示哪些，默认十一个全开），左下角标
+`cam A` / `cam B`。`s` 存的是**拼好的整张**。
 
 **两半都必须在屏幕内**：两台 1280x720 并排是 2560 宽，屏幕只有 1280 宽时右半幅
 会整个跑到屏幕外（只看得到左边那台，很容易误以为"没拼成两半"）。所以每半幅在
@@ -20,15 +21,19 @@ RTMPose 全身动作识别 demo —— **双摄入口**（扩展坞上两台 USB
 
 **本入口两台都只报数、不判状态**（这是刻意的，不是还没做完）：
     两个机位里有几个能测仰头、读数基线各是多少，都要先看数据才知道 ——
-    所以两台都不建 decision 对象，画面上两行状态统一写 `not decided (report only)`。
-    要判定就用单机入口 `main_action_demo.py`（它带着仰头的状态机）。
+    所以两台都不建 decision 对象，所有动作的状态行统一写
+    `not decided (report only)`。要判定就用单机入口 `main_action_demo.py`。
+
+**平滑**：每半幅在 features 之后、绘制之前跑一层 EMA（`--smooth-alpha`，默认
+0.3，1.0 = 关）。只平滑有效读数 —— 丢帧仍是 N/A、不维持旧值；几何线仍画原始
+坐标。平滑器有跨帧状态，**两台各一套**，不能共用。
 
 `--cameras` 为什么存在：扩展坞/USB Hub 的**枚举顺序常常不稳**，哪台是 A 哪台是 B
 不能靠猜。两台各自打开时会打印"编号 + 实到分辨率"，认不准就照着改编号重跑。
 带宽也是一样 —— 两台挂在一个 Hub 上可能只能跑低分辨率，`--width/--height` 是
 逃生口（一台正常、另一台长期读不到帧，通常就是带宽不够）。
 
-两个动作对机位的依赖完全不同，两台要分开看（详见 CLAUDE.md）：
+原有两个动作对机位的依赖完全不同，两台要分开看（详见 CLAUDE.md）：
     * **举手**：任意机位都能测；
     * **仰头**：**只在侧对 / 45° 前侧有意义**。某台若是正对机位，它的仰头读数
       会自己判几何退化 → N/A + 画面上标 [geometry degenerate]（这是特征层已有的
@@ -39,6 +44,8 @@ RTMPose 全身动作识别 demo —— **双摄入口**（扩展坞上两台 USB
     python main_dual_demo.py --list-cameras                   # 先查：0..5 哪些编号能用
     python main_dual_demo.py                                 # 两台用 capture 里的默认编号
     python main_dual_demo.py --cameras 2,1                    # 显式指定两台编号
+    python main_dual_demo.py --smooth-alpha 0.2               # 更强平滑（默认 0.3）
+    python main_dual_demo.py --smooth-alpha 1.0               # 关掉平滑，看原始读数
     python main_dual_demo.py --width 640 --height 480         # 带宽不够时降分辨率
     python main_dual_demo.py --display-width 1920              # 窗口整宽上限（默认按屏幕自动）
     python main_dual_demo.py --log-interval 0                 # 控制台不打读数行
@@ -67,8 +74,66 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from capture import (CameraCapture, probe_cameras,         # noqa: E402
                      USB_CAMERA_INDEX, USB_CAMERA_INDEX_B)
 from pose_estimation import detect_pose                    # noqa: E402
-from features import ArmRaiseFeatures, HeadTiltFeatures    # noqa: E402
-from output import FrameRenderer                           # noqa: E402
+from features import (ArmRaiseFeatures, HeadTiltFeatures,  # noqa: E402
+                      TrunkFlexFeatures, NeckLateralTiltFeatures,
+                      ElbowFlexFeatures, TrunkRotationFeatures,
+                      KneeFlexFeatures, HipFlexFeatures,
+                      ShoulderAbductionFeatures, PelvicTiltFeatures,
+                      ScapularSymmetryFeatures)
+from output import (ACTION_ORDER, FrameRenderer,           # noqa: E402
+                    overlay_layout)
+from smoothing import AngleSmoother                        # noqa: E402
+
+
+def _parse_alpha(text: str) -> float:
+    """--smooth-alpha：EMA 系数必须在 (0, 1]；1.0 = 关掉平滑。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"alpha 必须是数字（收到 {text!r}）")
+    if not (0.0 < value <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"--smooth-alpha 必须在 (0, 1] 内（收到 {value}）；1.0 = 不平滑")
+    return value
+
+
+def _parse_positive_float(text: str) -> float:
+    """--smooth-fast-delta：必须 > 0（adaptive EMA 的"大跳变"门限）。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"必须是数字（收到 {text!r}）")
+    if value <= 0.0:
+        raise argparse.ArgumentTypeError(f"必须 > 0（收到 {value}）")
+    return value
+
+
+def _parse_nonneg_float(text: str) -> float:
+    """--smooth-deadband：必须 >= 0（0 = 关闭死区）。"""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"必须是数字（收到 {text!r}）")
+    if value < 0.0:
+        raise argparse.ArgumentTypeError(f"必须 >= 0（收到 {value}）")
+    return value
+
+
+def _parse_actions(text: str) -> tuple:
+    """解析 --actions：逗号分隔 → 按 ACTION_ORDER 规范顺序去重的元组。
+
+    与单机入口的同名参数语义一致；**入口之间不互相 import**，所以这里单独写一份
+    （只依赖 output.ACTION_ORDER）。未知名字直接报错。
+    """
+    names = [t.strip() for t in text.split(",") if t.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("--actions 不能为空")
+    bad = [n for n in names if n not in ACTION_ORDER]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"未知动作 {bad}；可选：{','.join(ACTION_ORDER)}")
+    chosen = set(names)
+    return tuple(a for a in ACTION_ORDER if a in chosen)
 
 # 拼图窗口标题；两台在拼图/日志/画面标签里的名字（顺序 = 左右 = --cameras 的顺序）
 WINDOW_TITLE = "Action Demo (RTMPose) - dual cam"
@@ -82,18 +147,38 @@ _LABEL_COLOR_DEAD = (170, 170, 170)
 class _Stream:
     """一路数据源的全部运行时对象。
 
-    **每台一套，绝不共用**：features 那两个类目前不持有跨帧状态、本可以共用，
-    但 decision 那两个类是**有跨帧状态**的（迟滞带靠上一帧的状态），共用就会把
+    **每台一套，绝不共用**：features 那些类目前不持有跨帧状态、本可以共用，
+    但 decision 那些类是**有跨帧状态**的（迟滞带靠上一帧的状态），共用就会把
     两台的证据搅在一起。统一按"每路一套"建 —— 便宜，且以后给特征加跨帧状态时
-    不会突然出事。（本入口两条线都只报数，干脆不建 decision，见模块说明。）
+    不会突然出事。（本入口所有动作都只报数，干脆不建 decision，见模块说明。）
     """
 
     def __init__(self, name: str, index: int, width: int, height: int,
-                 tilt_min_dx_ratio: float, draw_skeleton: bool) -> None:
+                 tilt_min_dx_ratio: float, draw_skeleton: bool,
+                 smooth_alpha: float, smooth_adaptive: bool = False,
+                 smooth_fast_delta: float = 10.0,
+                 smooth_deadband: float = 0.0,
+                 abduction_ref: str = 'image') -> None:
         self.name = name
         self.src = CameraCapture(index=index, width=width, height=height)
-        self.arm_feats = ArmRaiseFeatures()
-        self.head_feats = HeadTiltFeatures(min_dx_span_ratio=tilt_min_dx_ratio)
+        # 平滑器有跨帧状态，**两台各一个**（共用会把两路的读数混在一起）
+        self.smoother = AngleSmoother(
+            alpha=smooth_alpha, adaptive=smooth_adaptive,
+            fast_delta_deg=smooth_fast_delta,
+            deadband_deg=smooth_deadband)
+        self.feats = {
+            'arm': ArmRaiseFeatures(),
+            'head': HeadTiltFeatures(min_dx_span_ratio=tilt_min_dx_ratio),
+            'trunk': TrunkFlexFeatures(),
+            'neck': NeckLateralTiltFeatures(),
+            'elbow': ElbowFlexFeatures(),
+            'rotation': TrunkRotationFeatures(),
+            'knee': KneeFlexFeatures(),
+            'hip': HipFlexFeatures(),
+            'abduction': ShoulderAbductionFeatures(reference=abduction_ref),
+            'pelvic': PelvicTiltFeatures(),
+            'scapular': ScapularSymmetryFeatures(),
+        }
         self.ren = FrameRenderer(draw_skeleton=draw_skeleton)
         self.last_log_ts = 0.0
         # 最近一次读到的帧尺寸 (h, w)。只记尺寸、不存像素 —— 读不到帧时那半幅
@@ -134,6 +219,30 @@ def build_parser() -> argparse.ArgumentParser:
                         f"默认 {USB_CAMERA_INDEX},{USB_CAMERA_INDEX_B}"
                         f"（capture.USB_CAMERA_INDEX / USB_CAMERA_INDEX_B）。"
                         f"扩展坞枚举顺序不稳 —— 认不准就按两台各自打印的编号试")
+    p.add_argument("--actions", type=_parse_actions,
+                   default=ACTION_ORDER, metavar="LIST",
+                   help="每半幅显示哪些动作（逗号分隔，默认全开）："
+                        + ",".join(ACTION_ORDER) +
+                        "。本入口对所有这些动作都只报数、不判状态")
+    p.add_argument("--smooth-alpha", type=_parse_alpha, default=0.3, metavar="A",
+                   help="每半幅角度读数的 EMA 平滑系数，取值 (0,1]（默认 0.3）。"
+                        "越小越平滑、跟动作越滞后；1.0 = 关掉平滑。"
+                        "只平滑有效读数：丢帧仍是 N/A（不维持旧值），"
+                        "几何辅助线仍画原始关键点；两台各用各的平滑状态")
+    p.add_argument("--smooth-adaptive", choices=("on", "off"), default="on",
+                   help="自适应 EMA（默认 on，两台同参数）：单帧跳变 >= "
+                        "fast-delta 时当帧跟上，小抖动照常压。模块默认 off")
+    p.add_argument("--smooth-fast-delta", type=_parse_positive_float,
+                   default=10.0, metavar="DEG",
+                   help="自适应 EMA 判定'大跳变'的单帧差值（度，默认 10.0）")
+    p.add_argument("--smooth-deadband", type=_parse_nonneg_float,
+                   default=0.0, metavar="DEG",
+                   help="死区（度，默认 0 = 关闭）：与上一输出值比较，慢速漂移"
+                        "累积越带后仍会更新，不会被永久冻住")
+    p.add_argument("--abduction-ref", choices=("image", "trunk"),
+                   default="image",
+                   help="肩外展参考轴（默认 image = 画面向下竖直轴；trunk = "
+                        "肩中点→髋中点，实验选项；缺躯干点直接 N/A）")
     p.add_argument("--width", type=int, default=1280,
                    help="期望分辨率宽（默认 1280）。两台挂一个扩展坞带宽不够时"
                         "降到 640 试试")
@@ -230,12 +339,16 @@ def _compose_pair(fa: np.ndarray,
     return np.hstack([a, b]), a.shape[1]
 
 
-def _log_line(name: str, arm: dict, head: dict) -> str:
+def _log_line(name: str, arm: dict, head: dict,
+              actions: tuple = (), feats: Optional[dict] = None) -> str:
     """一路的实时读数行（控制台），诊断量与单机入口完全一致。
 
     仰头那个角在"正对镜头"或"只认出一只耳"时会退化成 dx≈0（角度由噪声定符号），
     光看角度分不清是哪一种 —— 来源/置信度/两个像素点一摆出来就能分辨。双摄时这套
     诊断量正是判断**第二台机位能不能测仰头**的依据，所以照单机入口原样保留。
+
+    actions/feats 给了就再追加本次显示的新动作读数（`--actions` 的子集），
+    不显示的动作不占控制台 —— 画面和控制台看的是同一组东西。
     """
     deg = arm.get('arm_raise_deg')
     side = arm.get('arm_raise_side') or '--'
@@ -252,10 +365,60 @@ def _log_line(name: str, arm: dict, head: dict) -> str:
     if em and ns:
         diag += (f" ear_mid=({em[0]:.0f},{em[1]:.0f})"
                  f" nose=({ns[0]:.0f},{ns[1]:.0f})")
-    return (f"[{name}] arm={side}"
-            f" {'--' if deg is None else f'{deg:.1f}deg'}"
-            f"  head={'--' if hdeg is None else f'{hdeg:.1f}deg'}"
-            f"  [{diag}]")
+    def fmt(v, reason=None):
+        if v is not None:
+            return f'{v:.1f}'
+        # N/A 带上原因短码：双摄时这正是"第二台机位为何测不到"的证据
+        return '--' if not reason else f'--({reason})'
+
+    extra = []
+    if feats:
+        for kind in actions:
+            f = feats.get(kind)
+            if f is None:
+                continue
+            if kind == 'trunk':
+                extra.append(f"trunk={fmt(f.get('trunk_flex_deg'), f.get('trunk_flex_invalid_reason'))}")
+            elif kind == 'neck':
+                extra.append(f"neck={fmt(f.get('neck_lateral_deg'), f.get('neck_lateral_invalid_reason'))}")
+            elif kind == 'elbow':
+                extra.append(
+                    f"elbow=L{fmt(f.get('elbow_flex_left_deg'), f.get('elbow_flex_left_invalid_reason'))}"
+                    f"/R{fmt(f.get('elbow_flex_right_deg'), f.get('elbow_flex_right_invalid_reason'))}")
+            elif kind == 'rotation':
+                extra.append(f"rot={fmt(f.get('trunk_rotation_deg'), f.get('trunk_rotation_invalid_reason'))}")
+            elif kind == 'knee':
+                extra.append(
+                    f"knee=L{fmt(f.get('knee_flex_left_deg'), f.get('knee_flex_left_invalid_reason'))}"
+                    f"/R{fmt(f.get('knee_flex_right_deg'), f.get('knee_flex_right_invalid_reason'))}")
+            elif kind == 'hip':
+                extra.append(
+                    f"hip=L{fmt(f.get('hip_flex_left_deg'), f.get('hip_flex_left_invalid_reason'))}"
+                    f"/R{fmt(f.get('hip_flex_right_deg'), f.get('hip_flex_right_invalid_reason'))}")
+            elif kind == 'abduction':
+                extra.append(
+                    f"abd=L{fmt(f.get('shoulder_abduction_left_deg'), f.get('shoulder_abduction_left_invalid_reason'))}"
+                    f"/R{fmt(f.get('shoulder_abduction_right_deg'), f.get('shoulder_abduction_right_invalid_reason'))}")
+            elif kind == 'pelvic':
+                extra.append(f"pelvic={fmt(f.get('pelvic_tilt_deg'), f.get('pelvic_tilt_invalid_reason'))}")
+            elif kind == 'scapular':
+                extra.append(
+                    f"scap={fmt(f.get('scapular_symmetry_deg'), f.get('scapular_symmetry_invalid_reason'))}")
+    tail = ("  " + " ".join(extra)) if extra else ""
+    arm_reason = (arm.get('arm_raise_left_invalid_reason')
+                  or arm.get('arm_raise_right_invalid_reason'))
+    head_reason = head.get('head_pitch_invalid_reason')
+    def na(prefix, reason):
+        """N/A 文本：`--` / `--(geom)`；已知侧时 `L--(no_point)`。"""
+        core = '--' if prefix == '--' else f"{prefix}--"
+        return core + (f"({reason})" if reason else "")
+
+    arm_txt = (f"{side} {deg:.1f}deg" if deg is not None
+               else na(side, arm_reason))
+    head_txt = (f"{hdeg:.1f}deg" if hdeg is not None
+                else na('', head_reason))
+    return (f"[{name}] arm={arm_txt}  head={head_txt}"
+            f"{tail}  [{diag}]")
 
 
 def _open_all(streams: List[_Stream], cameras: Tuple[int, int]) -> bool:
@@ -332,10 +495,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
               f"改用 --cameras {idx_a},{idx_b} 指定两台，或改 capture 里的默认常量")
         return 1
 
+    smooth_kw = dict(
+        smooth_adaptive=(args.smooth_adaptive == 'on'),
+        smooth_fast_delta=args.smooth_fast_delta,
+        smooth_deadband=args.smooth_deadband,
+        abduction_ref=args.abduction_ref)
     streams = [_Stream(STREAM_NAMES[0], idx_a, args.width, args.height,
-                       args.tilt_min_dx_ratio, args.draw_skeleton),
+                       args.tilt_min_dx_ratio, args.draw_skeleton,
+                       args.smooth_alpha, **smooth_kw),
                _Stream(STREAM_NAMES[1], idx_b, args.width, args.height,
-                       args.tilt_min_dx_ratio, args.draw_skeleton)]
+                       args.tilt_min_dx_ratio, args.draw_skeleton,
+                       args.smooth_alpha, **smooth_kw)]
 
     if not _open_all(streams, args.cameras):
         return 1
@@ -359,8 +529,21 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     print(f"[dual] 两台：{STREAM_NAMES[0]} = #{idx_a}（左），"
           f"{STREAM_NAMES[1]} = #{idx_b}（右）—— 编号认不准就改 --cameras A,B")
-    print("[dual] 本入口**两条线都只报数、不判状态**（两台都写 not decided）——"
+    print("[dual] 本入口**所有动作都只报数、不判状态**（两台都写 not decided）——"
           "先把两个机位的数看明白；要判状态用单机入口 main_action_demo.py")
+    print(f"[dual] 每半幅显示动作（--actions）：{','.join(args.actions)}"
+          f"（每个动作两行，左右独立动作左右各一行）")
+    smooth_desc = f"EMA alpha={args.smooth_alpha:g}"
+    if args.smooth_alpha < 1.0:
+        smooth_desc += (f"，自适应={'开' if args.smooth_adaptive == 'on' else '关'}"
+                        f"（大跳变阈值 {args.smooth_fast_delta:g}°）"
+                        f"，死区 {args.smooth_deadband:g}°")
+    print(f"[dual] 平滑：{smooth_desc}"
+          + ("（关闭，原始读数）" if args.smooth_alpha >= 1.0 else "")
+          + "；每台各一套平滑状态，丢帧仍 N/A、几何线仍用原始坐标")
+    print(f"[dual] 肩外展参考轴（--abduction-ref）：{args.abduction_ref}"
+          + ("（实验：按肩中点→髋中点，躯干点缺一 → N/A [no trunk ref]）"
+             if args.abduction_ref == 'trunk' else ""))
     print(f"[dual] 分辨率上限 {args.width}x{args.height}；"
           f"控制台 {'不打' if args.log_interval <= 0 else f'每 {args.log_interval:g}s 每台一行'}"
           f"；某台正对机位时它的仰头会判几何退化、读数 N/A（正常现象）")
@@ -397,24 +580,42 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 st.last_shape = frame.shape[:2]
                 if pose is not None and frame is not full:
                     pose = _retag_image_size(pose, frame.shape[1], frame.shape[0])
-                arm = st.arm_feats.update(pose)
-                head = st.head_feats.update(pose)
+                # arm/head 始终算（控制台沿用原来那套诊断量）；新动作只在
+                # 本次显示时才计算（--actions 子集）
+                feats = {'arm': st.smoother.update(st.feats['arm'].update(pose)),
+                         'head': st.smoother.update(st.feats['head'].update(pose))}
+                for kind in args.actions:
+                    if kind not in feats:
+                        feats[kind] = st.smoother.update(
+                            st.feats[kind].update(pose))
+                items = []
+                for kind in args.actions:      # 已按 ACTION_ORDER 规范化
+                    payload = {'features': feats[kind]}
+                    if kind in ('elbow', 'knee', 'hip', 'abduction'):
+                        payload['states'] = {}     # 左右都未判 → report only
+                    else:
+                        payload['state'] = None    # 本入口一律只报数
+                    items.append((kind, payload))
 
+                # 半幅可能只有 640x360：按实际高度收紧行高/字号，22 行不出画
+                line_h, text_scale = overlay_layout(frame.shape[0],
+                                                    len(args.actions))
                 st.ren.draw_skeleton_frame(frame, pose)
-                # 状态一律传 None：本入口两台都不判状态，画面上两行写
-                # "not decided (report only)"——不假装判过
-                st.ren.draw_action_overlay(frame, arm, None, head, None,
-                                           show_geometry=args.geometry)
+                st.ren.draw_all_action_overlay(
+                    frame, items, show_geometry=args.geometry,
+                    line_h=line_h, text_scale=text_scale)
                 halves.append(frame)
 
                 now = time.monotonic()
                 if args.log_interval > 0 and now - st.last_log_ts >= args.log_interval:
                     st.last_log_ts = now
-                    print(_log_line(st.name, arm, head), flush=True)
+                    print(_log_line(st.name, feats['arm'], feats['head'],
+                                    actions=args.actions, feats=feats),
+                          flush=True)
 
             composite, split_x = _compose_pair(halves[0], halves[1])
             # 标签画在**拼好的整张**上（不跟着半幅的缩放走），位置在左下角 ——
-            # 上面四行读数从 y=30 起排到 ~114，左下角空着，不打架
+            # 读数从 y=30 起往下排（行数由 --actions 决定），左下角空着，不打架
             ch = composite.shape[0]
             for i, st in enumerate(streams):
                 x = 12 if i == 0 else split_x + 12
@@ -551,6 +752,121 @@ def selftest() -> None:
     # 两帧都是黑底，读数行区域之外应当干干净净（没有几何线画进来）
     assert int(np.count_nonzero(a_frame[120:, :])) == 0, \
         "只给读数不给几何时，下半幅不该有笔画"
+
+    # 6) 九个新动作：全身合成姿态 → 读数有效，左右独立动作左右分开
+    full = {
+        5: (0.40, 0.37), 6: (0.60, 0.33),
+        3: (0.45, 0.18), 4: (0.55, 0.18), 0: (0.50, 0.18),
+        7: (0.35, 0.50), 9: (0.32, 0.63),      # 左臂伸直
+        8: (0.68, 0.45), 10: (0.64, 0.28),     # 右肘上折
+        11: (0.42, 0.60), 12: (0.58, 0.60),
+        13: (0.43, 0.75), 15: (0.43, 0.90),    # 左腿伸直
+        14: (0.72, 0.62), 16: (0.68, 0.75),    # 右膝抬起
+    }
+    fp = _pose(full, size)
+    trunk = TrunkFlexFeatures().update(fp)
+    neck = NeckLateralTiltFeatures().update(fp)
+    elbow = ElbowFlexFeatures().update(fp)
+    rot = TrunkRotationFeatures().update(fp)
+    knee = KneeFlexFeatures().update(fp)
+    hip = HipFlexFeatures().update(fp)
+    abduction = ShoulderAbductionFeatures().update(fp)
+    pelvic = PelvicTiltFeatures().update(fp)
+    scapular = ScapularSymmetryFeatures().update(fp)
+    assert trunk['trunk_flex_valid'] and neck['neck_lateral_valid']
+    assert rot['trunk_rotation_valid']
+    assert elbow['elbow_flex_left_deg'] > 150.0 > elbow['elbow_flex_right_deg']
+    assert knee['knee_flex_left_deg'] > 150.0 > knee['knee_flex_right_deg']
+    assert hip['hip_flex_left_deg'] > 150.0 > hip['hip_flex_right_deg']
+    assert abduction['shoulder_abduction_left_valid'] and \
+        abduction['shoulder_abduction_right_valid']
+    assert 20.0 < abduction['shoulder_abduction_left_deg'] < 35.0
+    assert 35.0 < abduction['shoulder_abduction_right_deg'] < 50.0
+    assert pelvic['pelvic_tilt_valid'] and abs(pelvic['pelvic_tilt_deg']) < 1.0
+    assert scapular['scapular_symmetry_valid'] and \
+        abs(scapular['scapular_symmetry_deg']) > 5.0
+
+    # 单侧丢点只作废该侧（不拿另一侧或别的点补）
+    no_left_wrist = {k: v for k, v in full.items() if k != 9}
+    e2 = ElbowFlexFeatures().update(_pose(no_left_wrist, size))
+    assert e2['elbow_flex_left_deg'] is None and \
+        e2['elbow_flex_right_deg'] is not None
+    no_left_elbow = {k: v for k, v in full.items() if k != 7}
+    a2 = ShoulderAbductionFeatures().update(_pose(no_left_elbow, size))
+    assert a2['shoulder_abduction_left_deg'] is None and \
+        a2['shoulder_abduction_right_deg'] is not None
+
+    # 骨盆/肩胛缺一个点 → 整条 N/A（不做单侧降级）
+    no_right_hip = {k: v for k, v in full.items() if k != 12}
+    p2 = PelvicTiltFeatures().update(_pose(no_right_hip, size))
+    assert p2['pelvic_tilt_valid'] is False and p2['pelvic_tilt_deg'] is None
+    no_right_shoulder = {k: v for k, v in full.items() if k != 6}
+    s2 = ScapularSymmetryFeatures().update(_pose(no_right_shoulder, size))
+    assert s2['scapular_symmetry_valid'] is False and \
+        s2['scapular_symmetry_deg'] is None
+
+    # 7) 十一个动作叠加到 640x360 的半幅：全部只报数，22 行收紧后仍在画面内
+    items = [
+        ('arm', {'features': a_arm, 'state': None}),
+        ('head', {'features': a_head, 'state': None}),
+        ('trunk', {'features': trunk, 'state': None}),
+        ('neck', {'features': neck, 'state': None}),
+        ('elbow', {'features': elbow, 'states': {}}),
+        ('rotation', {'features': rot, 'state': None}),
+        ('knee', {'features': knee, 'states': {}}),
+        ('hip', {'features': hip, 'states': {}}),
+        ('abduction', {'features': abduction, 'states': {}}),
+        ('pelvic', {'features': pelvic, 'state': None}),
+        ('scapular', {'features': scapular, 'state': None}),
+    ]
+    half = np.zeros((360, 640, 3), dtype=np.uint8)
+    lh, sc = overlay_layout(360, len(ACTION_ORDER))
+    assert lh < 26 and 0.35 <= sc < 0.50
+    FrameRenderer(draw_skeleton=False).draw_all_action_overlay(
+        half, items, line_h=lh, text_scale=sc)
+    last_y = 30 + (2 * len(ACTION_ORDER) - 1) * lh
+    assert last_y + 4 < 360, "收紧后最后一行仍须在画面内"
+    assert label_pixels(half, 0, 640, last_y - 8, last_y + 6) > 0, \
+        "最后一个动作的状态行没画出来"
+
+    # 8) --actions：规范顺序、去重、未知名字报错（与单机入口同一语义）
+    assert _parse_actions('hip,arm,neck,arm') == ('arm', 'neck', 'hip')
+    assert _parse_actions(','.join(ACTION_ORDER)) == ACTION_ORDER
+    try:
+        _parse_actions('arm,bogus')
+    except argparse.ArgumentTypeError:
+        pass
+    else:
+        raise AssertionError("未知动作名应报错，不能静默忽略")
+
+    # 9) 平滑状态每路一套：共用实例会把两台的读数混在一起（这里能抓出来）
+    sa, sb = AngleSmoother(0.5), AngleSmoother(0.5)
+    sa.update({'head_pitch_deg': 10.0})
+    sb.update({'head_pitch_deg': 40.0})
+    assert sa.update({'head_pitch_deg': 10.0})['head_pitch_deg'] == 10.0, \
+        "A 路的平滑状态被 B 路污染了"
+    assert sb.update({'head_pitch_deg': 40.0})['head_pitch_deg'] == 40.0, \
+        "B 路的平滑状态被 A 路污染了"
+
+    # 10) 优化项参数路径：自适应 EMA、trunk 参考轴、控制台 N/A 带原因
+    s = AngleSmoother(0.3, adaptive=True, fast_delta_deg=10.0)
+    s.update({'a_deg': 100.0})
+    assert s.update({'a_deg': 120.0})['a_deg'] == 120.0, \
+        "自适应 EMA 遇大跳变应当帧跟上"
+    abd_trunk = ShoulderAbductionFeatures(reference='trunk').update(fp)
+    assert abd_trunk['shoulder_abduction_ref'] == 'trunk'
+    assert abd_trunk['shoulder_abduction_left_valid'], \
+        "躯干点齐全时 trunk 参考应照常出读数"
+    abd_no_trunk = ShoulderAbductionFeatures(reference='trunk').update(
+        _pose(no_right_hip, size))
+    assert abd_no_trunk['shoulder_abduction_left_invalid_reason'] == 'no_trunk'
+    assert abd_no_trunk['shoulder_abduction_right_invalid_reason'] == 'no_trunk', \
+        "缺髋点应整条 N/A 并标 no_trunk，不静默退回 image 参考"
+
+    # 控制台：N/A 读数带原因短码（双摄查第二机位用）
+    line = _log_line('cam A', a_arm, a_head, ('elbow',), {'elbow': e2})
+    assert 'arm=--(no_point)' in line and 'head=--(no_point)' in line, line
+    assert 'elbow=L--(no_point)' in line, line
 
     print("  selftest_dual: OK")
 

@@ -44,7 +44,11 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from decision import ArmRaiseState, HeadTiltState
+from decision import (ArmRaiseState, HeadTiltState,
+                      TrunkFlexState, NeckLateralState, ElbowFlexState,
+                      TrunkRotationState, KneeFlexState, HipFlexState,
+                      ShoulderAbductionState, PelvicTiltState,
+                      ScapularSymmetryState)
 
 # 骨架：17 个 COCO 关键点之间怎么连线（RTMPose 输出的 COCO 17 点）。
 # 只保留躯干 + 四肢连线；头部/面部 0-4 不画（脸只用于角度计算）。
@@ -67,26 +71,108 @@ _ACTION_STATE_LABEL = {
     ArmRaiseState.DOWN: "DOWN",
     HeadTiltState.TILTED_BACK: "TILTED_BACK",
     HeadTiltState.NEUTRAL: "NEUTRAL",
+    TrunkFlexState.FLEXED: "FLEXED",
+    TrunkFlexState.NEUTRAL: "NEUTRAL",
+    NeckLateralState.TILTED: "TILTED",
+    NeckLateralState.NEUTRAL: "NEUTRAL",
+    ElbowFlexState.FLEXED: "FLEXED",
+    ElbowFlexState.EXTENDED: "EXTENDED",
+    TrunkRotationState.ROTATED: "ROTATED",
+    TrunkRotationState.NEUTRAL: "NEUTRAL",
+    KneeFlexState.FLEXED: "FLEXED",
+    KneeFlexState.EXTENDED: "EXTENDED",
+    HipFlexState.FLEXED: "FLEXED",
+    HipFlexState.EXTENDED: "EXTENDED",
+    ShoulderAbductionState.ABDUCTED: "ABDUCTED",
+    ShoulderAbductionState.ADDUCTED: "ADDUCTED",
+    PelvicTiltState.TILTED: "TILTED",
+    PelvicTiltState.NEUTRAL: "NEUTRAL",
+    ScapularSymmetryState.ASYMMETRIC: "ASYMMETRIC",
+    ScapularSymmetryState.SYMMETRIC: "SYMMETRIC",
 }
 _ACTION_STATE_COLOR = {
     ArmRaiseState.RAISED: _ACTION_TRIGGER_COLOR,
     ArmRaiseState.DOWN: _ACTION_IDLE_COLOR,
     HeadTiltState.TILTED_BACK: _ACTION_TRIGGER_COLOR,
     HeadTiltState.NEUTRAL: _ACTION_IDLE_COLOR,
+    TrunkFlexState.FLEXED: _ACTION_TRIGGER_COLOR,
+    TrunkFlexState.NEUTRAL: _ACTION_IDLE_COLOR,
+    NeckLateralState.TILTED: _ACTION_TRIGGER_COLOR,
+    NeckLateralState.NEUTRAL: _ACTION_IDLE_COLOR,
+    ElbowFlexState.FLEXED: _ACTION_TRIGGER_COLOR,
+    ElbowFlexState.EXTENDED: _ACTION_IDLE_COLOR,
+    TrunkRotationState.ROTATED: _ACTION_TRIGGER_COLOR,
+    TrunkRotationState.NEUTRAL: _ACTION_IDLE_COLOR,
+    KneeFlexState.FLEXED: _ACTION_TRIGGER_COLOR,
+    KneeFlexState.EXTENDED: _ACTION_IDLE_COLOR,
+    HipFlexState.FLEXED: _ACTION_TRIGGER_COLOR,
+    HipFlexState.EXTENDED: _ACTION_IDLE_COLOR,
+    ShoulderAbductionState.ABDUCTED: _ACTION_TRIGGER_COLOR,
+    ShoulderAbductionState.ADDUCTED: _ACTION_IDLE_COLOR,
+    PelvicTiltState.TILTED: _ACTION_TRIGGER_COLOR,
+    PelvicTiltState.NEUTRAL: _ACTION_IDLE_COLOR,
+    ScapularSymmetryState.ASYMMETRIC: _ACTION_TRIGGER_COLOR,
+    ScapularSymmetryState.SYMMETRIC: _ACTION_IDLE_COLOR,
 }
+
+# 动作显示顺序：入口的 --actions 按这个顺序取子集，画面行序也按它。
+# arm/head 是原有两条线；其余按 2026-10-18 两批新增的顺序排在下面。
+ACTION_ORDER = ("arm", "head", "trunk", "neck", "elbow", "rotation", "knee", "hip",
+                "abduction", "pelvic", "scapular")
 # 状态未判时画面上的写法：**不写状态词**，明说"只报数不判"，免得看画的人以为
-# 已经有个规则在跑。举手那条线 v1 默认就是这一档（--arm-rule off）；双摄入口
-# 两条线都走这一档（两台都只报数）。两个块共用同一句话，别各写一份。
+# 已经有个规则在跑。举手与九个新动作默认就是这一档（--*-rule off）；双摄入口
+# 所有动作都走这一档（两台都只报数）。所有块共用同一句话，别各写一份。
 _ACTION_NOT_DECIDED = "not decided (report only)"
+
+# features 层给的无效原因短码 → 画面上的一句话（英文短文本，cv2 只能画 ASCII）。
+# 缺键 = 老 payload / 原因未知：不追加任何后缀，保持旧画面不变。
+_INVALID_REASON_TEXT = {
+    'no_pose': 'no pose',
+    'no_size': 'no frame size',
+    'no_point': 'no point',
+    'out_of_frame': 'out of frame',
+    'geom': 'geom too small',
+    'degenerate': 'geometry degenerate',
+    'no_trunk': 'no trunk ref',
+}
 
 # 动作叠加的 y 行位（像素）：举手读数 30 / 举手状态 56 / 仰头读数 82 / 仰头状态 108。
 _ACTION_Y = 30
 _ACTION_LINE_H = 26
 
+
+def overlay_layout(frame_height: int, n_actions: int,
+                   top: int = _ACTION_Y, min_line_h: int = 14) -> tuple:
+    """按画面高度/动作数算 (line_h, text_scale)，让每块两行都留在画面内。
+
+    单机入口 720p 全开 8 个动作时 avail//16 = 42 > 26，**取默认行高/字号**
+    （画面上和原来一致）；双摄每半幅可能只有 640x360，22 行按 26px 会出画，
+    这里按可用高度收紧行高，字号等比缩（不低到 0.35，再小就看不清了）。
+    """
+    n_rows = 2 * max(1, n_actions)
+    avail = max(1, frame_height - top - 6)
+    line_h = max(min_line_h, min(_ACTION_LINE_H, avail // n_rows))
+    text_scale = 0.50
+    if line_h < _ACTION_LINE_H:
+        text_scale = max(0.35, 0.50 * line_h / _ACTION_LINE_H)
+    return line_h, text_scale
+
+
 # 动作几何用色（BGR）：举手（肩-肘-腕）蓝、仰头（耳-鼻）黄、参考虚线灰
 _ACTION_ARM_GEOM_COLOR = (255, 160, 0)
 _ACTION_HEAD_GEOM_COLOR = (0, 220, 255)
 _ACTION_REF_COLOR = (110, 110, 110)     # 几何参考虚线（竖直/水平参考轴）
+
+# 新增动作的几何用色（BGR）：每个动作一种，画面上一眼能分清是哪条线
+_ACTION_TRUNK_GEOM_COLOR = (255, 80, 80)      # 躯干前屈：肩髋连线
+_ACTION_NECK_GEOM_COLOR = (0, 255, 180)       # 颈部侧屈：双耳连线
+_ACTION_ELBOW_GEOM_COLOR = (0, 140, 255)      # 肘屈伸：肩肘腕三点线
+_ACTION_ROTATION_GEOM_COLOR = (200, 0, 255)   # 躯干旋转：肩线 + 髋线
+_ACTION_KNEE_GEOM_COLOR = (0, 200, 0)         # 膝屈伸：髋膝踝三点线
+_ACTION_HIP_GEOM_COLOR = (255, 0, 200)        # 髋前屈：肩髋膝三点线
+_ACTION_ABDUCTION_GEOM_COLOR = (0, 180, 255)  # 肩外展：肩肘连线 + 参考轴
+_ACTION_PELVIC_GEOM_COLOR = (255, 120, 0)     # 骨盆倾斜：双髋连线
+_ACTION_SCAPULAR_GEOM_COLOR = (0, 255, 120)   # 肩胛对称：双肩连线
 
 
 class FrameRenderer:
@@ -152,6 +238,170 @@ class FrameRenderer:
             self._draw_head_block(frame, head, head_state, head_enter_deg, y)
         return frame
 
+    # ---------- 多动作统一叠加（原两条线 + 九个新动作） ----------
+
+    def draw_all_action_overlay(self, frame: np.ndarray,
+                                actions: list,
+                                show_geometry: bool = True,
+                                line_h: Optional[int] = None,
+                                text_scale: Optional[float] = None) -> np.ndarray:
+        """按顺序叠加本次运行的各动作读数/状态/几何（**只呈现，不计算**）。
+
+        参数:
+            actions: [(kind, payload), ...]，顺序就是画面的行序。kind 取
+                'arm' / 'head' / 'trunk' / 'neck' / 'elbow' / 'rotation' /
+                'knee' / 'hip' / 'abduction' / 'pelvic' / 'scapular'；
+                payload 是 dict：
+                    'features': features.update() 的返回值；None 表示本次不显示
+                    'state':    单动作状态（arm/head/trunk/neck/rotation/
+                                pelvic/scapular）
+                    'states':   左右独立动作的状态 {'L': ..., 'R': ...}
+                                （elbow/knee/hip/abduction）
+                    'enter_deg': 当前阈值，仅用于状态行后面的对照文字
+                **state/states 传 None 的含义与 draw_action_overlay 一致**：
+                只报数、不判状态，状态行写 `not decided (report only)`。
+            show_geometry: 是否画各动作的几何辅助线（--no-geometry 统一控制）。
+
+        画面行序由调用方决定（入口按 output.ACTION_ORDER 取 --actions 子集）。
+        每个动作占两行：单动作 = 读数行 + 状态行；左右独立动作 = 左、右各一行
+        （每行同时带该侧的读数和状态，左右各自一套状态机，不合并）。
+
+        本方法不 import / 调用 features 或 decision 的计算逻辑；几何坐标全部来自
+        features 返回的 *_geom dict。
+
+        line_h/text_scale: 可选的行高与字号。双摄入口每半幅可能要缩到 640 宽
+        （高 ~360），十一个动作 22 行按默认 26px 会出画 —— 调用方按半幅高度收紧，
+        本层只负责画。None = 用模块默认值（单机入口不需要传）。
+        """
+        line_h = _ACTION_LINE_H if line_h is None else int(line_h)
+        text_scale = 0.50 if text_scale is None else float(text_scale)
+        # 先画所有几何，再画所有文字：后面的几何线不会盖住前面已经画好的读数行
+        if show_geometry:
+            for kind, payload in actions:
+                feats = payload.get('features')
+                if feats is not None:
+                    self._draw_action_geometry(kind, frame, feats)
+
+        y = _ACTION_Y
+        for kind, payload in actions:
+            feats = payload.get('features')
+            if feats is None:
+                continue
+            y = self._draw_action_block(kind, frame, feats, payload, y,
+                                        line_h, text_scale)
+        return frame
+
+    def _draw_action_block(self, kind: str, frame: np.ndarray,
+                           feats: dict, payload: dict, y: int,
+                           line_h: int = _ACTION_LINE_H,
+                           text_scale: float = 0.50) -> int:
+        """按 kind 画一个动作的两行，返回下一块的起始 y。"""
+        state = payload.get('state')
+        enter_deg = payload.get('enter_deg')
+        if kind == 'arm':
+            return self._draw_arm_block(frame, feats, state, enter_deg, y,
+                                        line_h, text_scale)
+        if kind == 'head':
+            self._draw_head_block(frame, feats, state, enter_deg, y,
+                                  line_h, text_scale)
+            return y + 2 * line_h
+        if kind == 'trunk':
+            return self._draw_single_action_block(
+                frame, feats, state, enter_deg, y,
+                'Trunk flex', 'trunk_flex_deg', '>=', line_h, text_scale)
+        if kind == 'neck':
+            return self._draw_single_action_block(
+                frame, feats, state, enter_deg, y,
+                'Neck lateral', 'neck_lateral_deg', '>=', line_h, text_scale)
+        if kind == 'rotation':
+            return self._draw_single_action_block(
+                frame, feats, state, enter_deg, y,
+                'Trunk rotation', 'trunk_rotation_deg', '>=', line_h,
+                text_scale)
+        if kind == 'elbow':
+            return self._draw_bilateral_action_block(
+                frame, feats, payload.get('states') or {}, y,
+                'Elbow flex', 'elbow_flex', line_h, text_scale)
+        if kind == 'knee':
+            return self._draw_bilateral_action_block(
+                frame, feats, payload.get('states') or {}, y,
+                'Knee flex', 'knee_flex', line_h, text_scale)
+        if kind == 'hip':
+            return self._draw_bilateral_action_block(
+                frame, feats, payload.get('states') or {}, y,
+                'Hip flex', 'hip_flex', line_h, text_scale)
+        if kind == 'abduction':
+            return self._draw_bilateral_action_block(
+                frame, feats, payload.get('states') or {}, y,
+                'Shoulder abduction', 'shoulder_abduction', line_h, text_scale)
+        if kind == 'pelvic':
+            return self._draw_single_action_block(
+                frame, feats, state, enter_deg, y,
+                'Pelvic tilt', 'pelvic_tilt_deg', '>=', line_h, text_scale)
+        if kind == 'scapular':
+            return self._draw_single_action_block(
+                frame, feats, state, enter_deg, y,
+                'Scapular sym', 'scapular_symmetry_deg', '>=', line_h,
+                text_scale)
+        raise ValueError(f"未知动作 kind: {kind!r}")
+
+    @staticmethod
+    def _state_color(state) -> tuple:
+        """状态对应的显示色；None（未判）与 UNKNOWN 都用灰色。"""
+        if state is None:
+            return _ACTION_NA_COLOR
+        return _ACTION_STATE_COLOR.get(state, _ACTION_NA_COLOR)
+
+    def _draw_single_action_block(self, frame: np.ndarray, feats: dict,
+                                  state, enter_deg: Optional[float], y: int,
+                                  label: str, deg_key: str,
+                                  enter_op: str,
+                                  line_h: int = _ACTION_LINE_H,
+                                  text_scale: float = 0.50) -> int:
+        """单动作两行：读数行 + 状态行（未判时写 report only）。"""
+        color = self._state_color(state)
+        deg = feats.get(deg_key)
+        line1 = f"{label} deg: {self._deg_text(deg)}"
+        # 读数 N/A 时把 features 给的原因写出来（缺键 = 老 payload，不追加）
+        if deg is None:
+            stem = deg_key[:-len('_deg')] if deg_key.endswith('_deg') else deg_key
+            line1 += self._reason_suffix(feats.get(f'{stem}_invalid_reason'))
+        # 骨盆/肩胛：哪一侧更高（键缺失或 None 时不加；不引入新阈值）
+        higher = feats.get(f'{deg_key[:-len("_deg")]}_higher') \
+            if deg_key.endswith('_deg') else None
+        if higher:
+            line1 += f"  ({higher} higher)"
+        if state is None:
+            line2 = f"{label} State: {_ACTION_NOT_DECIDED}"
+        else:
+            line2 = f"{label} State: {_ACTION_STATE_LABEL.get(state, 'N/A')}"
+            if enter_deg is not None:
+                line2 += f"  (enter {enter_op} {enter_deg:.1f} deg)"
+        _put_text_outlined(frame, line1, (12, y), text_scale, color)
+        _put_text_outlined(frame, line2, (12, y + line_h), text_scale, color)
+        return y + 2 * line_h
+
+    def _draw_bilateral_action_block(self, frame: np.ndarray, feats: dict,
+                                     states: dict, y: int,
+                                     label: str, prefix: str,
+                                     line_h: int = _ACTION_LINE_H,
+                                     text_scale: float = 0.50) -> int:
+        """左右独立动作：左、右各一行（每行带该侧读数与该侧状态）。"""
+        for side, key in (("L", "left"), ("R", "right")):
+            state = states.get(side)
+            color = self._state_color(state)
+            deg = feats.get(f'{prefix}_{key}_deg')
+            state_text = (_ACTION_NOT_DECIDED if state is None
+                          else _ACTION_STATE_LABEL.get(state, 'N/A'))
+            line = (f"{label} {side}: {self._deg_text(deg)} deg")
+            if deg is None:
+                line += self._reason_suffix(
+                    feats.get(f'{prefix}_{key}_invalid_reason'))
+            line += f"  State: {state_text}"
+            _put_text_outlined(frame, line, (12, y), text_scale, color)
+            y += line_h
+        return y
+
     @staticmethod
     def _deg_text(v: Optional[float]) -> str:
         """角度读数统一格式：算不出写 N/A（不写 0，0 是个有效读数）。
@@ -163,19 +413,52 @@ class FrameRenderer:
             return "N/A"
         return f"{0.0 if v == 0 else v:.1f}"
 
+    @staticmethod
+    def _reason_suffix(reason: Optional[str]) -> str:
+        """把 features 的无效原因短码变成画面后缀；未知/缺失 → 空串。"""
+        if not reason:
+            return ""
+        text = _INVALID_REASON_TEXT.get(reason)
+        return f"  [{text}]" if text else ""
+
     def _draw_arm_block(self, frame: np.ndarray, arm: dict,
                         arm_state: Optional[ArmRaiseState],
-                        enter_deg: Optional[float], y: int) -> int:
-        """画举手两行（读数行 + 状态行），返回下一块的起始 y。"""
+                        enter_deg: Optional[float], y: int,
+                        line_h: int = _ACTION_LINE_H,
+                        text_scale: float = 0.50) -> int:
+        """画举手两行（读数行 + 状态行），返回下一块的起始 y。
+
+        line_h/text_scale 只在多动作叠加时由调用方按画面高度收紧（双摄半幅）；
+        默认值就是原来的行高/字号，`draw_action_overlay` 的行为不变。
+        """
         color = _ACTION_STATE_COLOR.get(arm_state, _ACTION_NA_COLOR) \
             if arm_state is not None else _ACTION_NA_COLOR
         side = arm.get('arm_raise_side')
         side_s = side if side is not None else "--"
+
+        def side_text(deg_key: str, reason_key: str) -> str:
+            """一侧读数；N/A 时带上该侧原因（两侧原因可能不同，分开写）。"""
+            txt = self._deg_text(arm.get(deg_key))
+            if arm.get(deg_key) is None:
+                txt += self._reason_suffix(arm.get(reason_key))
+            return txt
+
         line1 = (f"Arm raise deg:  {side_s} {self._deg_text(arm.get('arm_raise_deg'))}"
-                 f"  (L {self._deg_text(arm.get('arm_raise_left_deg'))}"
-                 f"  R {self._deg_text(arm.get('arm_raise_right_deg'))})"
+                 f"  (L {side_text('arm_raise_left_deg', 'arm_raise_left_invalid_reason')}"
+                 f"  R {side_text('arm_raise_right_deg', 'arm_raise_right_invalid_reason')})"
                  f"   Elbow deg:  L {self._deg_text(arm.get('elbow_left_deg'))}"
                  f"  R {self._deg_text(arm.get('elbow_right_deg'))}")
+        if arm.get('arm_raise_deg') is None:
+            # 合并读数 N/A：把两侧原因并成一段（原因相同只写一次）
+            l_reason = arm.get('arm_raise_left_invalid_reason')
+            r_reason = arm.get('arm_raise_right_invalid_reason')
+            l_text = _INVALID_REASON_TEXT.get(l_reason) if l_reason else None
+            r_text = _INVALID_REASON_TEXT.get(r_reason) if r_reason else None
+            if l_text and r_text:
+                line1 += (f"  [{l_text}]" if l_text == r_text
+                          else f"  [L {l_text} / R {r_text}]")
+            elif l_text or r_text:
+                line1 += f"  [{l_text or r_text}]"
         if arm_state is None:
             # v1 默认：只报数不判（用户要先看数据再定触发用哪个角）
             line2 = (f"Arm State: {_ACTION_NOT_DECIDED}")
@@ -183,13 +466,15 @@ class FrameRenderer:
             line2 = f"Arm State: {_ACTION_STATE_LABEL.get(arm_state, 'N/A')}"
             if enter_deg is not None:
                 line2 += f"  (enter <= {enter_deg:.1f} deg)"
-        _put_text_outlined(frame, line1, (12, y), 0.50, color)
-        _put_text_outlined(frame, line2, (12, y + _ACTION_LINE_H), 0.50, color)
-        return y + 2 * _ACTION_LINE_H
+        _put_text_outlined(frame, line1, (12, y), text_scale, color)
+        _put_text_outlined(frame, line2, (12, y + line_h), text_scale, color)
+        return y + 2 * line_h
 
     def _draw_head_block(self, frame: np.ndarray, head: dict,
                          head_state: Optional[HeadTiltState],
-                         enter_deg: Optional[float], y: int) -> None:
+                         enter_deg: Optional[float], y: int,
+                         line_h: int = _ACTION_LINE_H,
+                         text_scale: float = 0.50) -> None:
         """画仰头两行（读数行 + 状态行）。"""
         color = _ACTION_STATE_COLOR.get(head_state, _ACTION_NA_COLOR) \
             if head_state is not None else _ACTION_NA_COLOR
@@ -211,14 +496,18 @@ class FrameRenderer:
         # 标记由 features 层给（本层不反推门控逻辑，见 features 的接口约定）
         if head.get('head_pitch_degenerate'):
             line1 += "  [geometry degenerate]"
+        elif head.get('head_pitch_deg') is None:
+            # 其它 N/A 原因（丢点 / 画面外 / 线段太短）；degenerate 已单独写出，
+            # 这里不重复。缺键（老 payload）→ 不追加。
+            line1 += self._reason_suffix(head.get('head_pitch_invalid_reason'))
         if head_state is None:
             line2 = f"Head State: {_ACTION_NOT_DECIDED}"
         else:
             line2 = f"Head State: {_ACTION_STATE_LABEL.get(head_state, 'N/A')}"
             if enter_deg is not None:
                 line2 += f"  (enter >= {enter_deg:.1f} deg)"
-        _put_text_outlined(frame, line1, (12, y), 0.50, color)
-        _put_text_outlined(frame, line2, (12, y + _ACTION_LINE_H), 0.50, color)
+        _put_text_outlined(frame, line1, (12, y), text_scale, color)
+        _put_text_outlined(frame, line2, (12, y + line_h), text_scale, color)
 
     def _draw_arm_geometry(self, frame: np.ndarray,
                            geom: Optional[dict]) -> None:
@@ -272,6 +561,212 @@ class FrameRenderer:
                            _ACTION_HEAD_GEOM_COLOR)
         _put_text_outlined(frame, "nose", (nx + 8, ny - 6), 0.40,
                            _ACTION_HEAD_GEOM_COLOR)
+
+    # ---------- 九个新动作的几何辅助线 ----------
+
+    def _draw_action_geometry(self, kind: str, frame: np.ndarray,
+                              feats: dict) -> None:
+        """按 kind 分派几何绘制。坐标全部来自 features 的 *_geom（本层只画）。"""
+        if kind == 'arm':
+            self._draw_arm_geometry(frame, feats.get('arm_geom'))
+        elif kind == 'head':
+            self._draw_head_tilt_geometry(frame, feats.get('head_tilt_geom'))
+        elif kind == 'trunk':
+            self._draw_trunk_flex_geometry(frame, feats.get('trunk_geom'))
+        elif kind == 'neck':
+            self._draw_neck_lateral_geometry(frame, feats.get('neck_geom'))
+        elif kind == 'rotation':
+            self._draw_trunk_rotation_geometry(
+                frame, feats.get('trunk_rotation_geom'))
+        elif kind == 'elbow':
+            self._draw_joint_chain_geometry(
+                frame, feats.get('elbow_flex_geom'),
+                _ACTION_ELBOW_GEOM_COLOR, 'elbow')
+        elif kind == 'knee':
+            self._draw_joint_chain_geometry(
+                frame, feats.get('knee_flex_geom'),
+                _ACTION_KNEE_GEOM_COLOR, 'knee')
+        elif kind == 'hip':
+            self._draw_joint_chain_geometry(
+                frame, feats.get('hip_flex_geom'),
+                _ACTION_HIP_GEOM_COLOR, 'hip')
+        elif kind == 'abduction':
+            self._draw_abduction_geometry(
+                frame, feats.get('shoulder_abduction_geom'))
+        elif kind == 'pelvic':
+            self._draw_pair_line_geometry(
+                frame, feats.get('pelvic_tilt_geom'),
+                ('hipL', 'hipR'), _ACTION_PELVIC_GEOM_COLOR, 'pelvis')
+        elif kind == 'scapular':
+            self._draw_pair_line_geometry(
+                frame, feats.get('scapular_symmetry_geom'),
+                ('shoulderL', 'shoulderR'), _ACTION_SCAPULAR_GEOM_COLOR,
+                'shoulders')
+        else:
+            raise ValueError(f"未知动作 kind: {kind!r}")
+
+    def _draw_trunk_flex_geometry(self, frame: np.ndarray,
+                                  geom: Optional[dict]) -> None:
+        """画躯干前屈几何：髋中点→肩中点连线 + 过髋中点的向上竖直参考虚线。
+
+        读数是这条连线与竖直轴的夹角，所以竖直参考线从**髋中点**（角的顶点）
+        向上画，画面上的夹角一眼能对上读数。
+        """
+        if not geom or not geom.get('shoulder_mid') or not geom.get('hip_mid'):
+            return
+        hip = (int(geom['hip_mid'][0]), int(geom['hip_mid'][1]))
+        sh = (int(geom['shoulder_mid'][0]), int(geom['shoulder_mid'][1]))
+        cv2.line(frame, hip, sh, _ACTION_TRUNK_GEOM_COLOR, 2, cv2.LINE_AA)
+        up_len = max(20, int(math.hypot(sh[0] - hip[0], sh[1] - hip[1])))
+        self._dashed_line(frame, hip, (hip[0], hip[1] - up_len),
+                          _ACTION_REF_COLOR)
+        cv2.circle(frame, hip, 5, _ACTION_TRUNK_GEOM_COLOR, -1, cv2.LINE_AA)
+        cv2.circle(frame, sh, 5, _ACTION_TRUNK_GEOM_COLOR, -1, cv2.LINE_AA)
+        _put_text_outlined(frame, "trunk", (sh[0] + 8, sh[1] + 18), 0.40,
+                           _ACTION_TRUNK_GEOM_COLOR)
+
+    def _draw_neck_lateral_geometry(self, frame: np.ndarray,
+                                    geom: Optional[dict]) -> None:
+        """画颈部侧屈几何：双耳连线 + 过一只耳的水平参考虚线。
+
+        features 只给"两只耳都可见"时的 geom（单耳不做降级），所以这里拿到的
+        一定是两耳；缺一个时整块不画，与读数 N/A 同步。
+        """
+        if not geom or not geom.get('earL') or not geom.get('earR'):
+            return
+        el = (int(geom['earL'][0]), int(geom['earL'][1]))
+        er = (int(geom['earR'][0]), int(geom['earR'][1]))
+        cv2.line(frame, el, er, _ACTION_NECK_GEOM_COLOR, 2, cv2.LINE_AA)
+        self._dashed_line(frame, el, (er[0], el[1]), _ACTION_REF_COLOR)
+        cv2.circle(frame, el, 5, _ACTION_NECK_GEOM_COLOR, -1, cv2.LINE_AA)
+        cv2.circle(frame, er, 5, _ACTION_NECK_GEOM_COLOR, -1, cv2.LINE_AA)
+        _put_text_outlined(frame, "ears", (el[0] - 46, el[1] - 8), 0.40,
+                           _ACTION_NECK_GEOM_COLOR)
+
+    def _draw_trunk_rotation_geometry(self, frame: np.ndarray,
+                                      geom: Optional[dict]) -> None:
+        """画躯干旋转几何：双肩连线 + 双髋连线（+ 各自过左端的水平参考虚线）。
+
+        读数是两条连线方向之差，两条线都画出来才看得出"肩转没转、髋跟没跟"。
+        四点缺任一 → 整块不画（features 已经按这条件置无效）。
+        """
+        if not geom:
+            return
+        keys = ('shoulderL', 'shoulderR', 'hipL', 'hipR')
+        if any(not geom.get(k) for k in keys):
+            return
+        sl = (int(geom['shoulderL'][0]), int(geom['shoulderL'][1]))
+        sr = (int(geom['shoulderR'][0]), int(geom['shoulderR'][1]))
+        hl = (int(geom['hipL'][0]), int(geom['hipL'][1]))
+        hr = (int(geom['hipR'][0]), int(geom['hipR'][1]))
+        for p, q in ((sl, sr), (hl, hr)):
+            cv2.line(frame, p, q, _ACTION_ROTATION_GEOM_COLOR, 2, cv2.LINE_AA)
+            self._dashed_line(frame, p, (q[0], p[1]), _ACTION_REF_COLOR)
+            cv2.circle(frame, p, 5, _ACTION_ROTATION_GEOM_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(frame, q, 5, _ACTION_ROTATION_GEOM_COLOR, -1, cv2.LINE_AA)
+        _put_text_outlined(frame, "shoulder", (sr[0] + 8, sr[1] - 6), 0.40,
+                           _ACTION_ROTATION_GEOM_COLOR)
+        _put_text_outlined(frame, "hip", (hr[0] + 8, hr[1] - 6), 0.40,
+                           _ACTION_ROTATION_GEOM_COLOR)
+
+    def _draw_joint_chain_geometry(self, frame: np.ndarray,
+                                   geom: Optional[dict],
+                                   color: tuple, label: str) -> None:
+        """画三点关节链（肩-肘-腕 / 髋-膝-踝 / 肩-髋-膝），左右各一条。
+
+        geom: {'L': {'p1','joint','p2'}, 'R': {...}}（像素坐标）。
+        某侧缺任一关键点时该侧没有 geom（features 已置无效），这里就不画 ——
+        与读数 N/A 同步，不拿别的点补。
+        """
+        if not geom:
+            return
+        for side in ('L', 'R'):
+            chain = geom.get(side)
+            if not chain or not all(chain.get(k) for k in ('p1', 'joint', 'p2')):
+                continue
+            p1 = (int(chain['p1'][0]), int(chain['p1'][1]))
+            joint = (int(chain['joint'][0]), int(chain['joint'][1]))
+            p2 = (int(chain['p2'][0]), int(chain['p2'][1]))
+            cv2.line(frame, p1, joint, color, 2, cv2.LINE_AA)
+            cv2.line(frame, joint, p2, color, 2, cv2.LINE_AA)
+            for p in (p1, joint, p2):
+                cv2.circle(frame, p, 5, color, -1, cv2.LINE_AA)
+            _put_text_outlined(frame, f"{label} {side}",
+                               (joint[0] + 8, joint[1] + 18), 0.40, color)
+
+    def _draw_abduction_geometry(self, frame: np.ndarray,
+                                 geom: Optional[dict]) -> None:
+        """画肩外展几何：肩→肘连线 + 参考轴虚线。
+
+        image 参考（默认）：参考轴 = 过肩点的向下竖直轴（0 = 手臂垂在体侧、
+        90 = 平举），另补一条水平参考线显示"水平分量展开到哪"。
+        trunk 参考：参考轴 = 肩中点→髋中点的躯干轴（geom['axis']），只画这一根
+        并标 `ref trunk` —— 画的必须是**读数真正用的那根轴**。
+        某侧缺肩或肘点时该侧没有 geom（features 已置无效），这里就不画 ——
+        与读数 N/A 同步，不拿别的点补。
+        """
+        if not geom:
+            return
+        for side in ('L', 'R'):
+            side_geom = geom.get(side)
+            if not side_geom or not side_geom.get('shoulder') \
+                    or not side_geom.get('elbow'):
+                continue
+            sh = (int(side_geom['shoulder'][0]), int(side_geom['shoulder'][1]))
+            el = (int(side_geom['elbow'][0]), int(side_geom['elbow'][1]))
+            arm_len = max(20, int(math.hypot(el[0] - sh[0], el[1] - sh[1])))
+            cv2.line(frame, sh, el, _ACTION_ABDUCTION_GEOM_COLOR, 2, cv2.LINE_AA)
+            axis = geom.get('axis')
+            if axis and axis.get('shoulder_mid') and axis.get('hip_mid'):
+                # trunk 参考：沿肩中点→髋中点的躯干轴方向画虚线（真正用的那根轴）
+                ax = axis['hip_mid'][0] - axis['shoulder_mid'][0]
+                ay = axis['hip_mid'][1] - axis['shoulder_mid'][1]
+                norm = math.hypot(ax, ay)
+                if norm > 1e-9:
+                    self._dashed_line(
+                        frame, sh,
+                        (int(sh[0] + arm_len * ax / norm),
+                         int(sh[1] + arm_len * ay / norm)),
+                        _ACTION_REF_COLOR)
+                    _put_text_outlined(frame, "ref trunk",
+                                       (sh[0] + 8, sh[1] - 8), 0.38,
+                                       _ACTION_REF_COLOR)
+            else:
+                # 向下竖直轴 = 手臂垂在体侧时的方向（外展 0° 的参考）
+                self._dashed_line(frame, sh, (sh[0], sh[1] + arm_len),
+                                  _ACTION_REF_COLOR)
+                # 水平参考线：朝肘所在的那一侧画
+                direction = 1 if el[0] >= sh[0] else -1
+                self._dashed_line(frame, sh,
+                                  (sh[0] + direction * arm_len, sh[1]),
+                                  _ACTION_REF_COLOR)
+            cv2.circle(frame, sh, 5, _ACTION_ABDUCTION_GEOM_COLOR, -1,
+                       cv2.LINE_AA)
+            cv2.circle(frame, el, 5, _ACTION_ABDUCTION_GEOM_COLOR, -1,
+                       cv2.LINE_AA)
+            _put_text_outlined(frame, f"abduction {side}",
+                               (el[0] + 8, el[1] + 18), 0.40,
+                               _ACTION_ABDUCTION_GEOM_COLOR)
+
+    def _draw_pair_line_geometry(self, frame: np.ndarray,
+                                 geom: Optional[dict],
+                                 keys: tuple, color: tuple,
+                                 label: str) -> None:
+        """画"两点连线 + 水平参考线"（骨盆倾斜 / 肩胛对称性）。
+
+        geom 是 features 给的像素坐标，keys 是两端点的键名。读数是这条连线与
+        水平线的夹角，所以补一条过左侧点的水平虚线，夹角一眼能对上读数。
+        两点缺任一 → 整块不画（features 已经按这条件置无效）。
+        """
+        if not geom or any(not geom.get(k) for k in keys):
+            return
+        a = (int(geom[keys[0]][0]), int(geom[keys[0]][1]))
+        b = (int(geom[keys[1]][0]), int(geom[keys[1]][1]))
+        cv2.line(frame, a, b, color, 2, cv2.LINE_AA)
+        self._dashed_line(frame, a, (b[0], a[1]), _ACTION_REF_COLOR)
+        cv2.circle(frame, a, 5, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, b, 5, color, -1, cv2.LINE_AA)
+        _put_text_outlined(frame, label, (a[0] + 8, a[1] + 18), 0.40, color)
 
     # ---------- 数据源标签 ----------
 
@@ -534,7 +1029,308 @@ def selftest_action_overlay() -> None:
     print("  selftest_action_overlay: OK")
 
 
+def selftest_extended_action_overlay() -> None:
+    """自测 draw_all_action_overlay：十一个动作按序排 22 行、左右独立动作左右分离、
+    无效读数写 N/A 不让行消失、状态未判写 report only、几何开关、未知 kind 报错。
+    用黑底帧数像素，不碰摄像头。"""
+    def trunk(deg=10.0, valid=True, geom=None):
+        return {'trunk_flex_deg': deg if valid else None,
+                'trunk_flex_valid': valid, 'trunk_flex_conf': 0.90,
+                'trunk_flex_pts': 'shoulder_mid+hip_mid' if valid else None,
+                'trunk_geom': geom}
+
+    def neck(deg=4.0, valid=True, geom=None):
+        return {'neck_lateral_deg': deg if valid else None,
+                'neck_lateral_valid': valid, 'neck_lateral_conf': 0.88,
+                'neck_geom': geom}
+
+    def rotation(deg=6.0, valid=True, geom=None):
+        return {'trunk_rotation_deg': deg if valid else None,
+                'trunk_rotation_valid': valid, 'trunk_rotation_conf': 0.86,
+                'trunk_rotation_shoulder_deg': 3.0 if valid else None,
+                'trunk_rotation_hip_deg': -3.0 if valid else None,
+                'trunk_rotation_geom': geom}
+
+    def bilateral(prefix: str, l=165.0, r=155.0, geom=None):
+        return {f'{prefix}_left_deg': l, f'{prefix}_right_deg': r,
+                f'{prefix}_left_valid': l is not None,
+                f'{prefix}_right_valid': r is not None,
+                f'{prefix}_left_conf': 0.92, f'{prefix}_right_conf': 0.91,
+                f'{prefix}_geom': geom or {}}
+
+    def arm(deg=38.0):
+        return {'arm_raise_deg': deg, 'arm_raise_side': 'L',
+                'arm_raise_left_deg': deg, 'arm_raise_right_deg': 152.0,
+                'arm_raise_conf': 0.91, 'arm_raise_valid': True,
+                'elbow_deg': 175.0, 'elbow_left_deg': 175.0,
+                'elbow_right_deg': None, 'elbow_valid': True,
+                'arm_geom': None}
+
+    def head(pitch=12.0):
+        return {'head_pitch_deg': pitch, 'head_pitch_valid': True,
+                'head_pitch_conf': 0.93, 'head_pitch_pts': 'ear_mid+nose',
+                'head_tilt_geom': None}
+
+    def abduction(l=90.0, r=15.0, geom=None):
+        return {'shoulder_abduction_left_deg': l,
+                'shoulder_abduction_right_deg': r,
+                'shoulder_abduction_left_valid': l is not None,
+                'shoulder_abduction_right_valid': r is not None,
+                'shoulder_abduction_left_conf': 0.90,
+                'shoulder_abduction_right_conf': 0.89,
+                'shoulder_abduction_geom': geom or {}}
+
+    def pelvic(deg=6.0, valid=True, geom=None):
+        return {'pelvic_tilt_deg': deg if valid else None,
+                'pelvic_tilt_valid': valid, 'pelvic_tilt_conf': 0.87,
+                'pelvic_tilt_geom': geom}
+
+    def scapular(deg=-4.0, valid=True, geom=None):
+        return {'scapular_symmetry_deg': deg if valid else None,
+                'scapular_symmetry_valid': valid,
+                'scapular_symmetry_conf': 0.88,
+                'scapular_symmetry_geom': geom}
+
+    # 几何画在右侧（x>=560），文字行都在左边，两边互不干扰
+    geoms = {
+        'trunk': {'shoulder_mid': (600.0, 200.0), 'hip_mid': (620.0, 300.0)},
+        'neck': {'earL': (560.0, 350.0), 'earR': (620.0, 360.0)},
+        'rotation': {'shoulderL': (560.0, 120.0), 'shoulderR': (620.0, 140.0),
+                     'hipL': (560.0, 180.0), 'hipR': (620.0, 200.0)},
+        'elbow': {'L': {'p1': (580.0, 200.0), 'joint': (600.0, 240.0),
+                        'p2': (620.0, 280.0)}},
+        'knee': {'L': {'p1': (580.0, 300.0), 'joint': (600.0, 340.0),
+                       'p2': (620.0, 380.0)}},
+        'hip': {'R': {'p1': (580.0, 220.0), 'joint': (600.0, 260.0),
+                      'p2': (620.0, 300.0)}},
+        'abduction': {'L': {'shoulder': (560.0, 160.0),
+                            'elbow': (640.0, 160.0)}},
+        'pelvic': {'hipL': (560.0, 320.0), 'hipR': (620.0, 300.0)},
+        'scapular': {'shoulderL': (560.0, 100.0),
+                     'shoulderR': (620.0, 90.0)},
+    }
+
+    def payloads(with_geom=False):
+        g = geoms if with_geom else {}
+        return [
+            ('arm', {'features': arm(), 'state': ArmRaiseState.DOWN,
+                     'enter_deg': 45.0}),
+            ('head', {'features': head(), 'state': HeadTiltState.NEUTRAL,
+                      'enter_deg': 20.0}),
+            ('trunk', {'features': trunk(geom=g.get('trunk')),
+                       'state': TrunkFlexState.NEUTRAL, 'enter_deg': 25.0}),
+            ('neck', {'features': neck(geom=g.get('neck')),
+                      'state': NeckLateralState.TILTED, 'enter_deg': 15.0}),
+            ('elbow', {'features': bilateral('elbow_flex', geom=g.get('elbow')),
+                       'states': {'L': ElbowFlexState.FLEXED,
+                                  'R': ElbowFlexState.EXTENDED}}),
+            ('rotation', {'features': rotation(geom=g.get('rotation')),
+                          'state': TrunkRotationState.NEUTRAL,
+                          'enter_deg': 15.0}),
+            ('knee', {'features': bilateral('knee_flex', geom=g.get('knee')),
+                      'states': {'L': KneeFlexState.EXTENDED,
+                                 'R': KneeFlexState.FLEXED}}),
+            ('hip', {'features': bilateral('hip_flex', geom=g.get('hip')),
+                     'states': {'L': HipFlexState.FLEXED,
+                                'R': HipFlexState.EXTENDED}}),
+            ('abduction', {'features': abduction(geom=g.get('abduction')),
+                           'states': {'L': ShoulderAbductionState.ABDUCTED,
+                                      'R': ShoulderAbductionState.ADDUCTED}}),
+            ('pelvic', {'features': pelvic(geom=g.get('pelvic')),
+                        'state': PelvicTiltState.NEUTRAL, 'enter_deg': 10.0}),
+            ('scapular', {'features': scapular(geom=g.get('scapular')),
+                          'state': ScapularSymmetryState.SYMMETRIC,
+                          'enter_deg': 10.0}),
+        ]
+
+    def render(actions, **kw):
+        frame = np.zeros((720, 640, 3), dtype=np.uint8)
+        FrameRenderer(draw_skeleton=False).draw_all_action_overlay(
+            frame, actions, **kw)
+        return frame
+
+    row_y = lambda i: _ACTION_Y + i * _ACTION_LINE_H
+
+    # 1) 十一个动作按 ACTION_ORDER 排满 22 行（每块两行），行位都落在画面内
+    f = render(payloads())
+    assert len(ACTION_ORDER) == 11
+    assert row_y(21) < 720, "22 行必须放得进 720p"
+    for i in range(22):
+        assert _summary_row_pixels(f, y=row_y(i)) > 0, f"第 {i} 行没画出来"
+
+    # 2) 左右独立动作：左/右各用各的状态色（不合并成一个状态）
+    assert _summary_row_pixels(f, near=_ACTION_STATE_COLOR[ElbowFlexState.FLEXED],
+                               y=row_y(8)) > 0, "肘左行颜色不对"
+    assert _summary_row_pixels(f, near=_ACTION_STATE_COLOR[ElbowFlexState.EXTENDED],
+                               y=row_y(9)) > 0, "肘右行颜色不对"
+    assert _summary_row_pixels(f, near=_ACTION_STATE_COLOR[KneeFlexState.FLEXED],
+                               y=row_y(13)) > 0, "膝右行颜色不对"
+    assert _summary_row_pixels(f, near=_ACTION_STATE_COLOR[HipFlexState.FLEXED],
+                               y=row_y(14)) > 0, "髋左行颜色不对"
+    assert _summary_row_pixels(
+        f, near=_ACTION_STATE_COLOR[ShoulderAbductionState.ABDUCTED],
+        y=row_y(16)) > 0, "肩外展左行颜色不对"
+    assert _summary_row_pixels(
+        f, near=_ACTION_STATE_COLOR[ShoulderAbductionState.ADDUCTED],
+        y=row_y(17)) > 0, "肩外展右行颜色不对"
+
+    # 3) 未判（None）→ 灰 + report only；无效读数 → N/A，但行照画
+    off = [(kind, {'features': p['features'], 'state': None,
+                   'states': {k: None for k in ('L', 'R')}})
+           for kind, p in payloads()]
+    f = render(off)
+    for i in range(22):
+        assert _summary_row_pixels(f, near=_ACTION_NA_COLOR, y=row_y(i)) > 0, \
+            f"第 {i} 行未判时应为灰色 report only"
+    invalid = [
+        ('trunk', {'features': trunk(deg=None, valid=False),
+                   'state': TrunkFlexState.UNKNOWN, 'enter_deg': 25.0}),
+        ('neck', {'features': neck(deg=None, valid=False),
+                  'state': NeckLateralState.UNKNOWN, 'enter_deg': 15.0}),
+        ('elbow', {'features': bilateral('elbow_flex', l=None, r=155.0),
+                   'states': {'L': ElbowFlexState.UNKNOWN,
+                              'R': ElbowFlexState.EXTENDED}}),
+        ('rotation', {'features': rotation(deg=None, valid=False),
+                      'state': TrunkRotationState.UNKNOWN, 'enter_deg': 15.0}),
+        ('knee', {'features': bilateral('knee_flex', l=None, r=None),
+                  'states': {'L': KneeFlexState.UNKNOWN,
+                             'R': KneeFlexState.UNKNOWN}}),
+        ('hip', {'features': bilateral('hip_flex', l=None, r=160.0),
+                 'states': {'L': HipFlexState.UNKNOWN,
+                            'R': HipFlexState.EXTENDED}}),
+        ('abduction', {'features': abduction(l=None, r=15.0),
+                       'states': {'L': ShoulderAbductionState.UNKNOWN,
+                                  'R': ShoulderAbductionState.ADDUCTED}}),
+        ('pelvic', {'features': pelvic(deg=None, valid=False),
+                    'state': PelvicTiltState.UNKNOWN, 'enter_deg': 10.0}),
+        ('scapular', {'features': scapular(deg=None, valid=False),
+                      'state': ScapularSymmetryState.UNKNOWN,
+                      'enter_deg': 10.0}),
+    ]
+    f = render(invalid)
+    for i in range(18):
+        assert _summary_row_pixels(f, y=row_y(i)) > 0, \
+            f"读数无效时第 {i} 行也要写 N/A，不能消失"
+
+    # 4) 几何开关：开→多出像素；关→与文字画面一致；缺端点不崩
+    base = render(payloads())
+    with_geom = render(payloads(with_geom=True), show_geometry=True)
+    assert int(np.count_nonzero(with_geom)) > int(np.count_nonzero(base)), \
+        "show_geometry=True 时几何线应额外画出像素"
+    assert int(np.count_nonzero(render(payloads(with_geom=True),
+                                       show_geometry=False))) == \
+        int(np.count_nonzero(base)), "show_geometry=False 时不该画任何几何"
+    for kind, bad in (
+            ('trunk', None), ('trunk', {}),
+            ('trunk', {'shoulder_mid': (600.0, 200.0)}),
+            ('neck', {'earL': (560.0, 350.0)}),
+            ('rotation', {'shoulderL': (560.0, 120.0),
+                          'shoulderR': (620.0, 140.0),
+                          'hipL': (560.0, 180.0)}),
+            ('elbow', {'L': {'p1': (580.0, 200.0),
+                             'joint': (600.0, 240.0)}})):
+        feats = {'trunk': trunk, 'neck': neck, 'rotation': rotation}.get(kind)
+        if feats is None:
+            feats = {'elbow_flex_left_deg': 165.0, 'elbow_flex_right_deg': None,
+                     'elbow_flex_geom': bad}
+        else:
+            feats = feats(geom=bad)
+        render([(kind, {'features': feats, 'state': None})])  # 不崩即可
+    # 新增几何的"缺端点不崩"：肩外展缺肘、双髋缺一个、双肩缺一个
+    render([('abduction', {'features': abduction(
+        geom={'L': {'shoulder': (560.0, 160.0)}}), 'states': {}})])
+    render([('pelvic', {'features': pelvic(
+        geom={'hipL': (560.0, 320.0)}), 'state': None})])
+    render([('scapular', {'features': scapular(
+        geom={'shoulderL': (560.0, 100.0)}), 'state': None})])
+
+    # 5) 只给子集时，行从顶上开始排、不出现空槽位
+    f = render(payloads()[2:4])
+    assert _summary_row_pixels(f, y=row_y(0)) > 0
+    assert _summary_row_pixels(f, y=row_y(3)) > 0
+    assert _summary_row_pixels(f, y=row_y(4)) == 0
+
+    # 6) 未知 kind 必须报错（防止入口拼错名字后静默少画一块）
+    try:
+        render([('balabala', {'features': trunk()})])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知动作 kind 应抛 ValueError")
+
+    # 7) 行高自适应：720p 全开用默认行高；360 高的半幅要收紧且仍放得下
+    assert overlay_layout(720, len(ACTION_ORDER)) == (_ACTION_LINE_H, 0.50)
+    lh, sc = overlay_layout(360, len(ACTION_ORDER))
+    assert lh < _ACTION_LINE_H and 0.35 <= sc < 0.50, \
+        f"矮画面应收紧行高/字号，实际 {lh}/{sc}"
+    assert _ACTION_Y + 2 * len(ACTION_ORDER) * lh <= 360, "收紧后 22 行仍须在画面内"
+
+    # 8) 优化轮新键：无效原因后缀 / 高侧标签 / trunk 参考几何。
+    #    只要求"带新键不崩、行仍画得出来"；具体文案不比对（cv2 字体渲染不可读）。
+    head_bad = {'head_pitch_deg': None, 'head_pitch_valid': False,
+                'head_pitch_conf': None, 'head_pitch_pts': None,
+                'head_pitch_invalid_reason': 'geom', 'head_tilt_geom': None}
+    head_deg = {'head_pitch_deg': None, 'head_pitch_valid': False,
+                'head_pitch_conf': None, 'head_pitch_pts': None,
+                'head_pitch_degenerate': True,
+                'head_pitch_invalid_reason': 'degenerate',
+                'head_tilt_geom': None}
+    arm_bad = {'arm_raise_deg': None, 'arm_raise_side': None,
+               'arm_raise_left_deg': None, 'arm_raise_right_deg': None,
+               'arm_raise_conf': None, 'arm_raise_valid': False,
+               'arm_raise_left_invalid_reason': 'no_point',
+               'arm_raise_right_invalid_reason': 'geom',
+               'elbow_deg': None, 'elbow_left_deg': None,
+               'elbow_right_deg': None, 'elbow_valid': False,
+               'arm_geom': None}
+    new_key_actions = [
+        ('arm', {'features': arm_bad, 'state': None}),
+        ('head', {'features': head_bad, 'state': HeadTiltState.UNKNOWN,
+                  'enter_deg': 20.0}),
+        ('head', {'features': head_deg, 'state': HeadTiltState.UNKNOWN,
+                  'enter_deg': 20.0}),
+        ('trunk', {'features': {**trunk(deg=None, valid=False),
+                                'trunk_flex_invalid_reason': 'geom'},
+                   'state': TrunkFlexState.UNKNOWN, 'enter_deg': 25.0}),
+        ('elbow', {'features': {**bilateral('elbow_flex', l=None, r=155.0),
+                                'elbow_flex_left_invalid_reason':
+                                    'out_of_frame'},
+                   'states': {'L': ElbowFlexState.UNKNOWN,
+                              'R': ElbowFlexState.EXTENDED}}),
+        ('abduction', {'features': {
+            **abduction(l=None, r=15.0),
+            'shoulder_abduction_left_invalid_reason': 'no_trunk'},
+            'states': {'L': ShoulderAbductionState.UNKNOWN,
+                       'R': ShoulderAbductionState.ADDUCTED}}),
+        ('pelvic', {'features': {**pelvic(deg=12.0),
+                                 'pelvic_tilt_higher': 'R'},
+                    'state': PelvicTiltState.TILTED, 'enter_deg': 10.0}),
+        ('scapular', {'features': {**scapular(deg=-8.0),
+                                   'scapular_symmetry_higher': 'L'},
+                      'state': ScapularSymmetryState.ASYMMETRIC,
+                      'enter_deg': 10.0}),
+    ]
+    f = render(new_key_actions)
+    for i in range(2 * len(new_key_actions)):
+        assert _summary_row_pixels(f, y=row_y(i)) > 0, \
+            f"带无效原因/高侧键时第 {i} 行也要画出来"
+
+    # trunk 参考几何：geom['axis'] 存在时沿躯干轴画虚线（额外像素）
+    abd_trunk = abduction(geom={
+        'L': {'shoulder': (560.0, 160.0), 'elbow': (640.0, 160.0)},
+        'axis': {'shoulder_mid': (600.0, 200.0), 'hip_mid': (600.0, 300.0)}})
+    acts = [('abduction', {'features': abd_trunk,
+                           'states': {'L': ShoulderAbductionState.ABDUCTED,
+                                      'R': ShoulderAbductionState.ADDUCTED}})]
+    assert int(np.count_nonzero(render(acts, show_geometry=True))) > \
+        int(np.count_nonzero(render(acts, show_geometry=False))), \
+        "trunk 参考轴应额外画出虚线"
+
+    print("  selftest_extended_action_overlay: OK")
+
+
 if __name__ == "__main__":
     # 自测（不需要摄像头；绘制部分用黑底帧数像素，其余靠人工跑 demo 看）
     selftest_action_overlay()
+    selftest_extended_action_overlay()
     print("output selftest: ALL PASSED")

@@ -781,6 +781,43 @@ class FrameRenderer:
         """
         _put_text_outlined(frame, text, org, 0.7, color, 2)
 
+    # ---------- 姿态检测诊断（--pose-debug） ----------
+
+    def draw_pose_debug(self, frame: np.ndarray, info: dict,
+                        text_scale: float = 0.5) -> None:
+        """把 pose_estimation.detect_pose_debug 的 info 叠到画面右上角。
+
+        这是 --pose-debug 的**画面版**：控制台那行 `[pose] ...` 在窗口里看不到，
+        所以把同样的量画出来。两行：
+            pose score=0.213 core=5/9 whole OK
+            conf 0:0.62 3:0.44 4:0.61 5:0.72 6:0.70 ...
+        绿 = 本帧判到人，琥珀 = 判不到人（NO-PERSON）。
+
+        **本层只呈现**：score/core/stage/逐点置信度都是 pose 层算好的，
+        这里不重算判据、不改 info。放右上角是为了避开左侧的动作读数行。
+        """
+        if not info:
+            return
+        w = frame.shape[1]
+        accepted = bool(info.get('accepted'))
+        core_scores = info.get('core_scores') or {}
+        line1 = (f"pose score={info.get('overall_score', 0.0):.3f} "
+                 f"core={info.get('core_count', 0)}/{len(core_scores)} "
+                 f"{info.get('stage', '?')} "
+                 f"{'OK' if accepted else 'NO-PERSON'}")
+        line2 = ("conf " + " ".join(f"{pid}:{conf:.2f}"
+                                    for pid, conf in core_scores.items()))
+        color = _ACTION_IDLE_COLOR if accepted else _ACTION_TRIGGER_COLOR
+        # 右对齐：每行单独算宽度，避免长行被画面右缘裁掉
+        y = 12
+        for line in (line1, line2):
+            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX,
+                                          text_scale, 1)
+            y += th
+            org = (max(4, w - tw - 10), y)
+            _put_text_outlined(frame, line, org, text_scale, color)
+            y += 8
+
     # ---------- 骨架叠加 ----------
 
     def draw_skeleton_frame(self, frame: np.ndarray, pose: Optional[dict]) -> None:
@@ -1329,8 +1366,35 @@ def selftest_extended_action_overlay() -> None:
     print("  selftest_extended_action_overlay: OK")
 
 
+def selftest_pose_debug_overlay() -> None:
+    """--pose-debug 的画面诊断行：判到人/没判到人都画得出来，且只在右上角。"""
+    ren = FrameRenderer(draw_skeleton=False)
+    ok_info = {
+        'overall_score': 0.413, 'core_count': 5, 'accepted': True,
+        'stage': 'whole',
+        'core_scores': {0: 0.62, 3: 0.44, 4: 0.61, 5: 0.72, 6: 0.70,
+                        7: 0.41, 8: 0.39, 11: 0.31, 12: 0.30},
+    }
+    miss_info = dict(ok_info, overall_score=0.061, core_count=1,
+                     accepted=False, stage='none',
+                     core_scores={k: 0.05 for k in ok_info['core_scores']})
+    for info in (ok_info, miss_info):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        ren.draw_pose_debug(frame, info)
+        assert int(np.count_nonzero(frame)) > 0, "诊断行必须画出来"
+        # 右对齐画在右上角：左侧动作读数区不能被压住
+        assert np.count_nonzero(frame[:, :320]) == 0, "诊断行不该画到左半边"
+        assert np.count_nonzero(frame[:, 640:]) > 0, "诊断行应落在右半边"
+    # 空 info 不画、不崩（--pose-debug 关闭时不会走到这里，防御性检查）
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    ren.draw_pose_debug(frame, {})
+    assert int(np.count_nonzero(frame)) == 0
+    print("  selftest_pose_debug_overlay: OK")
+
+
 if __name__ == "__main__":
     # 自测（不需要摄像头；绘制部分用黑底帧数像素，其余靠人工跑 demo 看）
     selftest_action_overlay()
     selftest_extended_action_overlay()
+    selftest_pose_debug_overlay()
     print("output selftest: ALL PASSED")

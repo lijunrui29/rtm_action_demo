@@ -72,6 +72,8 @@ RTMPose 全身动作识别 demo（十一个动作）—— **单机入口**
     python main_action_demo.py --smooth-alpha 1.0            # 关掉平滑，看原始读数
     python main_action_demo.py --no-geometry                 # 不画角度几何辅助线
     python main_action_demo.py --snapshot data/action_snap.png  # 按 s 存当前帧
+    python main_action_demo.py --pose-debug                  # 打印检测诊断（分数/核心点/裁剪路径）
+    python main_action_demo.py --dump-pose-fail data/fail    # 判不到人的原始帧存盘
     python main_action_demo.py --selftest                    # 合成数据自测（不碰摄像头）
 
 按键：s 存快照（需 --snapshot 指定路径，否则忽略）、ESC 退出。
@@ -90,7 +92,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from capture import CameraCapture                        # noqa: E402
-from pose_estimation import detect_pose                  # noqa: E402
+from pose_estimation import (detect_pose, detect_pose_debug,  # noqa: E402
+                             selftest_pose_presence, CORE_CONF_THRESHOLD,
+                             CORE_MIN_COUNT)
 from features import (ArmRaiseFeatures,                  # noqa: E402
                       HeadTiltFeatures,
                       TrunkFlexFeatures, NeckLateralTiltFeatures,
@@ -124,7 +128,8 @@ from decision import (ArmRaiseDecision, ArmRaiseState,    # noqa: E402
                       selftest_scapular_symmetry_decision)
 from output import (ACTION_ORDER, FrameRenderer,          # noqa: E402
                     selftest_action_overlay,
-                    selftest_extended_action_overlay)
+                    selftest_extended_action_overlay,
+                    selftest_pose_debug_overlay)
 from smoothing import AngleSmoother, selftest_angle_smoother  # noqa: E402
 
 
@@ -188,6 +193,21 @@ def _parse_confirm_frames(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"必须 >= 1（收到 {value}）")
     return value
+
+
+def _format_pose_debug(info: dict) -> str:
+    """把 detect_pose_debug 的 info 压成一行控制台诊断。
+
+    core_conf 只列核心点（鼻/耳/肩/肘/髋），正好对应"有没有人"的判据；
+    哪几个点没上来、分数够不够，一眼能看出来。
+    """
+    core = ' '.join(f"{pid}:{conf:.2f}"
+                    for pid, conf in info['core_scores'].items())
+    return (f"[pose] score={info['overall_score']:.3f} "
+            f"core={info['core_count']}/{len(info['core_scores'])} "
+            f"stage={info['stage']} "
+            f"{'OK' if info['accepted'] else 'NO-PERSON'} "
+            f"core_conf=[{core}]")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,6 +340,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "间距 低于此值视为几何退化（正对镜头），读数报 N/A 而不是"
                         "给出 ±90 的假数。实测 45° 前侧 0.43~0.52、正对 0.013，"
                         "默认 0.15 取在空档中间")
+    p.add_argument("--pose-debug", action="store_true",
+                   help="打印姿态检测诊断（限流）：17 点平均分、核心点计数、"
+                        "各核心点置信度、本帧走的是整帧还是哪个候选裁剪框；"
+                        "同样的量也画在画面右上角。用于定位'测不到人'是判据、"
+                        "人太小还是画面本身的问题")
+    p.add_argument("--pose-debug-interval", type=_parse_positive_float,
+                   default=0.5, metavar="SEC",
+                   help="--pose-debug 的打印间隔（秒，默认 0.5）。"
+                        "判不到人的帧也按这个间隔限流，避免空场景刷屏")
+    p.add_argument("--dump-pose-fail", metavar="DIR", default=None,
+                   help="把判不到人的原始帧存到 DIR（最多每秒 1 张、共 200 张），"
+                        "用来看摄像头实际拍到了什么（曝光/模糊/人是否在画面里）。"
+                        "注意 data/ 下的实拍画面属个人数据，提交前想清楚")
     p.add_argument("--no-geometry", dest="geometry", action="store_false",
                    help="不画角度几何辅助线（举手的肩-肘-腕 + 向上竖直参考线、"
                         "仰头的耳中点→鼻 + 水平参考线）")
@@ -473,6 +506,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print("[action] 新增动作判据：" + ", ".join(rule_desc)
           + "（off = 只报数；on 时左右独立动作左右各一套状态机）")
     print("[action] 控制台仍只在 arm/head 状态变化时打诊断行；新动作读数看画面")
+    print(f"[action] 人物判据：核心点（鼻/耳/肩/肘/髋）conf>={CORE_CONF_THRESHOLD:g} "
+          f"的数量 >= {CORE_MIN_COUNT}，且肩/髋至少一个可见；"
+          f"不再用 17 点平均分（下肢出画不会再把'有人'判成没人）")
+
+    # 姿态诊断（--pose-debug / --dump-pose-fail）：只加观测，不改判定
+    need_pose_info = args.pose_debug or bool(args.dump_pose_fail)
+    dbg_state = {'last_print': 0.0, 'last_dump': 0.0, 'dumped': 0}
+    if args.pose_debug:
+        print(f"[pose] 诊断已开：每 {args.pose_debug_interval:g}s 打印一次 "
+              f"score/core/stage/core_conf；同样的量也画在画面右上角")
+    if args.dump_pose_fail:
+        Path(args.dump_pose_fail).mkdir(parents=True, exist_ok=True)
+        print(f"[pose] 判不到人的帧会存到 {args.dump_pose_fail} "
+              f"（最多每秒 1 张、共 200 张）")
 
     # 控制台只在**状态变化**时打一行（用于确认状态确实在变，不刷屏）
     prev = {ArmRaiseState.UNKNOWN, HeadTiltState.UNKNOWN}
@@ -484,7 +531,28 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     break
                 ts = time.monotonic()
 
-                pose = detect_pose(frame)
+                if need_pose_info:
+                    pose, pinfo = detect_pose_debug(frame)
+                else:
+                    pose, pinfo = detect_pose(frame), None
+
+                if pinfo is not None and args.pose_debug:
+                    if ts - dbg_state['last_print'] >= args.pose_debug_interval:
+                        dbg_state['last_print'] = ts
+                        print(_format_pose_debug(pinfo), flush=True)
+                if (pinfo is not None and args.dump_pose_fail
+                        and not pinfo['accepted']
+                        and ts - dbg_state['last_dump'] >= 1.0
+                        and dbg_state['dumped'] < 200):
+                    dbg_state['last_dump'] = ts
+                    dbg_state['dumped'] += 1
+                    fn = (Path(args.dump_pose_fail)
+                          / f"fail_{time.strftime('%Y%m%d_%H%M%S')}"
+                            f"_{dbg_state['dumped']:03d}.png")
+                    cv2.imwrite(str(fn), frame)
+                    print(f"[pose] 判不到人，已存 {fn} "
+                          f"(score={pinfo['overall_score']:.3f} "
+                          f"core={pinfo['core_count']})", flush=True)
                 # arm/head 始终计算：控制台的“状态变化”日志沿用原有行为。
                 # 平滑在 features 之后、decision / output 之前：判定与画面用的
                 # 都是平滑后的读数（丢帧仍 None，不沿用旧值）
@@ -530,6 +598,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 ren.draw_skeleton_frame(frame, pose)
                 ren.draw_all_action_overlay(frame, items,
                                             show_geometry=args.geometry)
+                # 诊断行画在最后，避免被骨架/动作叠加盖住（--pose-debug 才画）
+                if args.pose_debug and pinfo is not None:
+                    ren.draw_pose_debug(frame, pinfo)
 
                 cur = (arm_state, head_state)
                 if cur != prev:
@@ -877,6 +948,8 @@ def selftest() -> None:
     覆盖 features 十一个动作、decision 十一个动作、output 两套叠加、EMA 平滑，
     再加端到端：原举手/仰头链路、九个新动作的全身链路、平滑真的接在判定之前。
     """
+    print("===== 0. pose: presence gate / retry candidates =====")
+    selftest_pose_presence()
     print("===== 1. features: arm raise angles =====")
     selftest_arm_raise()
     print("===== 2. features: head tilt (pitch proxy) =====")
@@ -927,6 +1000,8 @@ def selftest() -> None:
     selftest_action_overlay()
     print("===== 25. output: extended action overlay =====")
     selftest_extended_action_overlay()
+    print("===== 25b. output: pose debug overlay =====")
+    selftest_pose_debug_overlay()
     print("===== 26. smoothing: EMA angle smoother =====")
     selftest_angle_smoother()
     print("===== 27. end-to-end: arm/head chain =====")

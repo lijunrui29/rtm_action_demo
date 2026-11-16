@@ -84,6 +84,8 @@ python main_action_demo.py --abduction-ref trunk              # 肩外展改用�
 python main_action_demo.py --no-geometry                      # 不画角度几何辅助线
 python main_action_demo.py --no-skeleton                      # 不画骨架
 python main_action_demo.py --snapshot data/action_snap.png    # 按 s 存当前帧
+python main_action_demo.py --pose-debug                       # 打印检测诊断（分数/核心点/裁剪路径）
+python main_action_demo.py --dump-pose-fail data/fail         # 判不到人的原始帧存盘
 python main_action_demo.py --selftest                         # 合成数据自测（不碰摄像头/模型）
 python test_new_actions.py                                    # 新增动作 + 优化项独立冒烟测试（合成姿态）
 ```
@@ -158,6 +160,9 @@ USB_CAMERA_INDEX_B = 1   # 双摄入口的第二台——枚举顺序不稳，�
 | `--no-geometry` | 关 | 不画角度几何辅助线（控制全部十一个动作的几何线） |
 | `--no-skeleton` | 关 | 不画骨架 |
 | `--snapshot PATH` | 无 | 按 `s` 把当前帧存到 PATH |
+| `--pose-debug` | 关 | 限流打印姿态检测诊断：17 点平均分、核心点计数、各核心点置信度、本帧走的是整帧还是哪个候选裁剪框；**同样的量也画在画面右上角**（`pose score=... core=5/9 whole OK` / `conf 0:0.62 ...`）。**定位「测不到人」先开它** |
+| `--pose-debug-interval SEC` | `0.5` | `--pose-debug` 的打印间隔；判不到人的帧也按此限流 |
+| `--dump-pose-fail DIR` | 无 | 把判不到人的原始帧存到 DIR（最多每秒 1 张、共 200 张），用来看摄像头实际拍到了什么 |
 | `--selftest` | — | 合成数据自测各层（不碰摄像头 / 模型） |
 
 `main_dual_demo.py` 的参数（**没有 `--arm-rule`：它不判状态**）：
@@ -210,7 +215,7 @@ rtm_action_demo/
 ├── main_dual_demo.py     # 【双摄入口】两台并排一个窗口；两台都只报数、不判状态
 ├── requirements.txt      # Python 依赖（pip install -r requirements.txt）
 ├── capture.py            # 图像输入：FrameSource / CameraCapture（编号默认写死，双摄入口可传）
-├── pose_estimation.py    # RTMPose 推理：17 个 COCO 关键点
+├── pose_estimation.py    # RTMPose 推理：17 个 COCO 关键点 + 人物判据/候选裁剪重试
 ├── features.py           # 特征：十一个动作各一个类（举手/仰头/躯干前屈/颈部侧屈/肘屈伸/躯干旋转/膝屈伸/髋前屈/肩外展/骨盆倾斜/肩胛对称性）
 ├── smoothing.py          # 平滑：AngleSmoother，按 key 独立做 EMA（有跨帧状态，每路一个）
 ├── decision.py           # 判断：十一个动作各一个状态机；肘/膝/髋/肩外展按 side 各建一套
@@ -258,7 +263,8 @@ rtm_action_demo/
 - **几何门控会让更多帧显示 N/A**：线段短于画面对角线 1%、关键点越出画面 2% 边距时，读数如实作废并标原因（`geom too small` / `out of frame`）。这是有意的「宁可不判、不给假数」；比例可在 `features.MIN_SEGMENT_RATIO` 调，但改完要重跑各层自测。
 - **N/A 原因短码**：`no pose`（没人/模型没返回）、`no frame size`、`no point`（关键点不可见）、`out of frame`（RTMPose 外推点）、`geom too small`（线段过短）、`geometry degenerate`（仅仰头：正对镜头）、`no trunk ref`（仅 `--abduction-ref trunk`：肩/髋点不全）。画面上跟在 N/A 后，控制台跟在 `--` 后。
 - **`--abduction-ref trunk` 是实验项**：原始需求写的是「躯干竖直轴」，当前默认仍是画面向下竖直轴。trunk 模式用肩中点→髋中点；躯干侧倾时会改变读数，但肩髋中点本身抖动也会串进来，未实拍验证前不建议当正式判据。缺躯干点直接两侧 N/A，**不会偷偷退回 image 参考**。
-- **单 / 多人**：目前按「整帧单一人」处理（top-down 无检测器；整帧失败时按人像区域裁剪重推，是接检测器之前的临时替代）。
+- **单 / 多人**：目前按「整帧单一人」处理（top-down 无检测器；整帧失败时按候选框裁剪重推，是接检测器之前的临时替代）。
+- **「测不到人」的判据**：不再看 17 点平均分，改成「核心点（鼻/耳/肩/肘/髋）中置信度 ≥0.3 的数量 ≥4，且肩或髋至少一个可见」。这样 45° 机位下下半身出画/被桌子挡住时，不会再因为低分点拖低均值而把人判成没人。整帧判不到时会依次试：本帧锚点框 → 上次成功帧的框 → 放大一档的框 → 画面中心 3:4 区域。**如果还是频繁丢人，先开 `--pose-debug --dump-pose-fail data/fail`**：看是核心点分数上不去（人太小/太暗/太糊），还是画面里根本没人，再决定要不要接 RTMDet 检测器或换更大模型。
 - **双摄入口不判状态**：`main_dual_demo.py` 两台的所有动作都只报数（状态行写 `not decided (report only)`）。两个机位里有几个能测仰头、读数基线各是多少，要先看数据才知道，所以这一档刻意不判。要判定用单机入口。
 - **双摄的帧率**：两台是**顺序**读帧、顺序推理（没有多线程），帧率约为单机的一半。看数够用；真要两台都跑满再单独做一轮。
 - **双摄的编号**：USB 扩展坞的枚举顺序常常不稳，`--cameras A,B` 就是为此留的。**认不准就先跑 `--list-cameras`**，它把 `0..N-1` 挨个开一遍、列出哪些能用和实到分辨率；两台同型号时分辨率也一样，那就得看画面内容才知道哪个编号对应哪个机位。两台打开时还会各自打印「编号 + 实到分辨率」。
